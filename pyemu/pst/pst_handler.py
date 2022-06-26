@@ -2291,7 +2291,7 @@ class Pst(object):
         if parfile is None:
             parfile = self.filename.replace(".pst", ".par")
         # first handle the case of a single parameter realization in a PAR file
-        if parfile.lower().endswith(".par"):
+        if parfile.lower().endswith(".par") or parfile.lower().split('.')[-2]=="par":
             print("Updating parameter values from {0}".format(parfile))
             par_df = pst_utils.read_parfile(parfile)
             self.parameter_data.index = self.parameter_data.parnme
