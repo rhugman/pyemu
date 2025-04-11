@@ -11,9 +11,9 @@ from pyemu.en import ObservationEnsemble
 from pyemu.mat.mat_handler import Matrix, Jco, Cov
 from pyemu.pst.pst_handler import Pst
 from .logger import Logger
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from scipy.stats import norm
+#from sklearn.decomposition import PCA
+#from sklearn.preprocessing import StandardScaler
+#from scipy.stats import norm
 
 class Emulator:
     """
@@ -113,14 +113,14 @@ class Emulator:
             if log_transform != False:
                 self.logger.statement("applying log transform")
                 ft.apply("log10", columns=log_transform)
-                log_transformed = ft.df.copy()
+                #log_transformed = ft.df.copy()
             #normal score transform
             if normal_score_transform:
                 self.logger.statement("applying normal score transform")
                 ft.apply("normal_score",
                          columns=ft.df.columns.tolist(),
                          quadratic_extrapolation=nst_extrapolate)
-                normal_score_transformed = ft.df.copy()
+                #normal_score_transformed = ft.df.copy()
             
 
             #autoencoder
@@ -419,6 +419,7 @@ def _moving_average_with_endpoints(y_values):
     return smoothed_y
 
 
+#TODO parse into the FeatureTransformer class
 class RowWiseMinMaxScaler:
     def __init__(self, feature_range=(-1, 1), groups=None, fit_groups=None):
         """
