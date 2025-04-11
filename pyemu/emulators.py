@@ -107,7 +107,7 @@ class Emulator:
             df = self.data.copy()
             if isinstance(df, ObservationEnsemble):
                 df = df._df
-            ft = FeatureTransformer(df)
+            ft = AutobotsAssemble(df)
 
             #log transform
             if log_transform != False:
@@ -201,7 +201,7 @@ class Emulator:
 
 
 
-class FeatureTransformer:
+class AutobotsAssemble:
     """
     Class for transforming features in a DataFrame.
     This class allows for applying and inverting various transformations
@@ -213,7 +213,7 @@ class FeatureTransformer:
         "b": [0.1, 0.5, 1.0]
     })
 
-    ft = FeatureTransformer(df)
+    ft = AutobotsAssemble(df)
     ft.apply("log10", columns=["a", "b"])
     log_transformed = ft.df.copy()
     ft.apply("standard", columns=["a"])
@@ -283,24 +283,24 @@ class FeatureTransformer:
         return out
 
 
-@FeatureTransformer.register_transform("log10")
+@AutobotsAssemble.register_transform("log10")
 def _log10(self, col):
     min_val = self.df[col].min()
     shift = -min_val + 1e-6 if min_val <= 0 else 0
     self.df[col] = np.log10(self.df[col] + shift)
     return {"shift": shift}
 
-@FeatureTransformer.register_inverse("log10")
+@AutobotsAssemble.register_inverse("log10")
 def _inv_log10(self, col, shift):
     self.df[col] = (10 ** self.df[col]) - shift
 
-@FeatureTransformer.register_transform("standard")
+@AutobotsAssemble.register_transform("standard")
 def _standard_scale(self, col):
     mean, std = self.df[col].mean(), self.df[col].std()
     self.df[col] = (self.df[col] - mean) / std
     return {"mean": mean, "std": std}
 
-@FeatureTransformer.register_inverse("standard")
+@AutobotsAssemble.register_inverse("standard")
 def _inv_standard_scale(self, col, mean, std):
     self.df[col] = self.df[col] * std + mean
 
@@ -339,7 +339,7 @@ class NormalScoreTransformer:
 
 
 
-@FeatureTransformer.register_transform("normal_score")
+@AutobotsAssemble.register_transform("normal_score")
 def _normal_score(self, col, tol=1e-7, max_samples=1000000,quadratic_extrapolation=False):
     x = self.df[col].values
     sorted_vals = np.sort(x)
@@ -356,7 +356,7 @@ def _normal_score(self, col, tol=1e-7, max_samples=1000000,quadratic_extrapolati
         "quadratic_extrapolation": quadratic_extrapolation,
     }
 
-@FeatureTransformer.register_inverse("normal_score")
+@AutobotsAssemble.register_inverse("normal_score")
 def _inv_normal_score(self, col, z_scores, originals, quadratic_extrapolation=False):
     z_scores = np.array(z_scores)
     originals = np.array(originals)
@@ -419,7 +419,7 @@ def _moving_average_with_endpoints(y_values):
     return smoothed_y
 
 
-#TODO parse into the FeatureTransformer class
+#TODO parse into the AutobotsAssemble class
 class RowWiseMinMaxScaler:
     def __init__(self, feature_range=(-1, 1), groups=None, fit_groups=None):
         """
