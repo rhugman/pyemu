@@ -11,8 +11,8 @@ from pyemu.en import ObservationEnsemble
 from pyemu.mat.mat_handler import Matrix, Jco, Cov
 from pyemu.pst.pst_handler import Pst
 from .logger import Logger
-
-
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 class Emulator:
     """
@@ -20,7 +20,7 @@ class Emulator:
     Instead, use one of the subclasses: DSI, GPR, etc. #TODO
     """
 
-    def __init__(self,pst=None,sim_ensemble=None,verbose=False):
+    def __init__(self,verbose=False):
         """
         Initialize the Emulator class.
 
@@ -31,15 +31,21 @@ class Emulator:
         self.logger = Logger(verbose)
         self.log = self.logger.log
 
+
+    #TODO: do we want to handle all data preprocessing/transforms here???
+
+
     class DSI:
         """
         Class for the DSI emulator.
         """
 
-        def __init__(self, pst=None,
+        def __init__(self, 
+                     pst=None,
                      sim_ensemble=None,
                      normal_score_transform=False,
-                     energy_threshold=0.9999):
+                     energy_threshold=0.9999,
+                     log_transform=False,verbose=False):
             """
             Initialize the DSI emulator.
 
@@ -51,46 +57,130 @@ class Emulator:
             sim_ensemble : ObservationEnsemble, optional
                 An ensemble of simulated observations. If provided, the emulator will
                 be initialized with the information from the ensemble.
+            normal_score_transform : bool, optional
+                If True, the emulator will apply a normal score transformation to the
+                simulated observations.
+            energy_threshold : float, optional 
+                The energy threshold for the SVD. Default is 0.9999.
+            log_transform : bool or list, optional
+                If True, the emulator will apply a log transformation to all the simulated
+                observations. If list of observation column names, will be applied to these. Default is False.
             """
-            super().__init__(pst=pst, sim_ensemble=sim_ensemble)
+
+            
+
+            super().__init__()
+            self.logger = Logger(verbose)
+            self.log = self.logger.log
+
             self.pst = pst
             self.__org_sim_ensemble = sim_ensemble
             self.data = sim_ensemble
+            self.data_transformed = None
+            self.feature_scaler = None
             self.energy_threshold = energy_threshold
-            from sklearn.decomposition import PCA
+            if log_transform is True:
+                self.log_transform = sim_ensemble.columns.tolist()
+            else:
+                self.log_transform = log_transform
+            assert isinstance(self.log_transform, (bool, list)), "log_transform must be a boolean or a list of column names"
 
             
-            def apply_feature_transforms():
-                #TODO
-                #standardize
-                #normal score transform
-                #log transform
-                #autoencoder
-                return
             
-            def _apply_pca(self):
-                self.pca = PCA(n_components=self.energy_threshold)
-                self.__data_pca = self.pca.fit_transform(self.sim_ensemble)
-                return
+
             
-            def _build_emulator(self):
-
-                #standardize data TODO
-
-                # autoconcder or PCA
-                _apply_pca(self)
-                #TODO
-
-                return
-
-
-            def forward_run():
-                #TODO
-                return
+        def apply_feature_transforms(self,log_transform=None):
+            #TODO
+            if log_transform is None:
+                log_transform = self.log_transform
+            if log_transform is True:
+                log_transform = self.data.columns.tolist()
             
-            def check_for_pdc():
-                #TODO
-                return
+            df = self.data.copy()
+            if isinstance(df, ObservationEnsemble):
+                df = df._df
+            ft = FeatureTransformer(df)
+
+            #log transform
+            if log_transform != False:
+                ft.apply("log10", columns=log_transform)
+                log_transformed = ft.df.copy()
+            #normal score transform
+            #TODO
+            
+
+            #autoencoder
+            #TODO
+
+
+            #update self
+            self.feature_transfomer = ft
+            self.data_transformed = ft.df.copy()
+            return
+        
+        def compute_projection_matrix(self,energy_threshold=None):
+            self.logger.statement("normalizing data")
+            # normalize the data by subtracting the mean and dividing by the standard deviation
+            X = self.data_transformed.copy()
+            deviations = X - X.mean()
+            z = deviations / np.sqrt(float(X.shape[0] - 1))
+            if isinstance(z, pd.DataFrame):
+                z = z.values
+
+            self.logger.statement("undertaking SVD")
+            u, s, v = np.linalg.svd(z, full_matrices=False)
+            us = np.dot(v.T, np.diag(s))
+            if energy_threshold is None:
+                energy_threshold = self.energy_threshold
+            if energy_threshold<1.0:
+                self.logger.statement("applying energy truncation")
+                # compute the cumulative energy of the singular values
+                cumulative_energy = np.cumsum(s**2) / np.sum(s**2)
+                print(cumulative_energy)
+                # find the number of components needed to reach the energy threshold
+                num_components = np.argmax(cumulative_energy >= energy_threshold) + 1
+                # keep only the first num_components singular values and vectors
+                us = us[:, :num_components]
+                s = s[:num_components]
+                u = u[:, :num_components]
+                print(f"Truncated from {len(s)} to {num_components} components while retaining {self.energy_threshold*100:.1f}% of variance")
+                if num_components<=1:
+                    print(f"Warning: only {num_components} component retained, you may need to check the data")
+            
+            self.logger.statement("calculating us matrix")
+           
+
+            # store components needed for forward run
+            # store mean vector
+            self.ovals = self.data_transformed.mean(axis=0)
+            # store proj matrix and singular values
+            self.pmat = us
+            self.s = s
+            return
+        
+
+
+        def forward_run(self,pvals):
+            #TODO
+            
+            pmat = self.pmat
+            ovals = self.ovals
+
+            sim_vals = ovals + np.dot(pmat,pvals)
+
+            #TODO: inverse transforms...
+            
+            ft = self.feature_transfomer
+            ft.inverse_on_external_df(sim_vals)
+            sim_vals = ft.inverse(columns=["a", "b"])
+
+            self.sim_vals = sim_vals
+
+            return sim_vals
+        
+        def check_for_pdc():
+            #TODO
+            return
             
 
 
@@ -98,7 +188,7 @@ class FeatureTransform:
     """
     Class for feature transforms.
     """
-    def __init__(self, pst=None, sim_ensemble=None):
+    def __init__(self, data=None):
         """
         Initialize the FeatureTransform class.
 
@@ -173,3 +263,186 @@ class FeatureTransform:
                 X_orig[group_cols] = group_std.mul(row_range, axis=0).add(row_min, axis=0)
                 
             return X_orig
+        
+    class NormalScoreTransform:
+        """
+        Class for normal score transformation.
+        """
+
+        from scipy.stats import norm, rankdata
+        from scipy.interpolate import interp1d
+
+        def __init__(self, pst=None, sim_ensemble=None):
+            super().__init__()
+            self.pst = pst
+            self.sim_ensemble = sim_ensemble
+            self._norm_score = None      
+       
+
+        def transform(data):
+            data = np.asarray(data)
+            ranks = rankdata(data, method='average')
+            cdf = ranks / (len(data) + 1)
+            nscores = norm.ppf(cdf)
+            return nscores
+
+        def inverse_transform(data, nscores, tail_fraction=0.05):
+            data = np.asarray(data)
+            sorted_data = np.sort(data)
+            n = len(data)
+
+            # Empirical CDF → normal scores
+            cdf_vals = (np.arange(1, n + 1)) / (n + 1)
+            norm_scores = norm.ppf(cdf_vals)
+
+            # Linear interpolator (within range)
+            interp = interp1d(norm_scores, sorted_data, kind='linear',
+                            bounds_error=False, fill_value=np.nan)
+
+            # Fit quadratics to tails
+            k = max(3, int(tail_fraction * n))  # at least 3 points
+
+            # Lower tail (quadratic fit)
+            coef_lo = np.polyfit(norm_scores[:k], sorted_data[:k], deg=2)
+            poly_lo = np.poly1d(coef_lo)
+
+            # Upper tail (quadratic fit)
+            coef_hi = np.polyfit(norm_scores[-k:], sorted_data[-k:], deg=2)
+            poly_hi = np.poly1d(coef_hi)
+
+            # Evaluate inverse with extrapolation
+            result = interp(nscores)
+            
+            # Apply quadratic extrapolation where needed
+            result = np.where(nscores < norm_scores[0], poly_lo(nscores), result)
+            result = np.where(nscores > norm_scores[-1], poly_hi(nscores), result)
+
+            return result
+
+
+    class LogTransformer:
+        """
+        Class for log transformation.
+        """
+
+        def __init__(self, df: pd.DataFrame):
+            self.df = df.copy()
+            self._log10_columns = {}
+
+        def log10_transform(self, columns, shift=1e-6):
+            for col in columns:
+                if col in self.df.columns:
+                    self.df[col] = np.log10(self.df[col] + shift)
+                    self._log10_columns[col] = {"shift": shift}
+                else:
+                    raise ValueError(f"Column '{col}' not in DataFrame")
+
+        def inverse_log10_transform(self):
+            for col, meta in self._log10_columns.items():
+                shift = meta["shift"]
+                self.df[col] = (10 ** self.df[col]) - shift
+
+
+
+class FeatureTransformer:
+    """
+    Class for transforming features in a DataFrame.
+    This class allows for applying and inverting various transformations
+    such as log transformations, standard scaling, etc.
+
+    # Sample usage
+    df = pd.DataFrame({
+        "a": [1, 10, 100],
+        "b": [0.1, 0.5, 1.0]
+    })
+
+    ft = FeatureTransformer(df)
+    ft.apply("log10", columns=["a", "b"])
+    log_transformed = ft.df.copy()
+    ft.apply("standard", columns=["a"])
+    standard_transformed = ft.df.copy()
+    
+    ft.inverse(columns=["a", "b"])
+    inverted_df = ft.df.copy()
+    
+    """
+
+    _transform_funcs = {}
+    _inverse_funcs = {}
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy()
+        self._transforms = {}
+
+    @classmethod
+    def register_transform(cls, name):
+        def decorator(func):
+            cls._transform_funcs[name] = func
+            return func
+        return decorator
+
+    @classmethod
+    def register_inverse(cls, name):
+        def decorator(func):
+            cls._inverse_funcs[name] = func
+            return func
+        return decorator
+
+    def apply(self, transform_name, columns, **kwargs):
+        if transform_name not in self._transform_funcs:
+            raise ValueError(f"Transform '{transform_name}' not registered.")
+        for col in columns:
+            func = self._transform_funcs[transform_name]
+            params = func(self, col, **kwargs)
+            if col not in self._transforms:
+                self._transforms[col] = []
+            self._transforms[col].append({"type": transform_name, "params": params})
+
+    def inverse(self, columns=None):
+        columns = columns or list(self._transforms.keys())
+        for col in columns:
+            if col not in self._transforms:
+                continue
+            for step in reversed(self._transforms[col]):
+                inv_func = self._inverse_funcs.get(step["type"])
+                if inv_func:
+                    inv_func(self, col, **step["params"])
+
+    def inverse_on_external_df(self, df, columns=None):
+        out = df.copy()
+        columns = columns or self._transforms.keys()
+        for col in columns:
+            if col not in self._transforms:
+                continue
+            for step in reversed(self._transforms[col]):
+                inv_func = self._inverse_funcs.get(step["type"])
+                if inv_func:
+                    # Temporarily patch self.df to use the external df
+                    original_df = self.df
+                    self.df = out
+                    inv_func(self, col, **step["params"])
+                    out = self.df
+                    self.df = original_df
+        return out
+
+
+@FeatureTransformer.register_transform("log10")
+def _log10(self, col, epsilon=1e-6):
+    min_val = self.df[col].min()
+    shift = -min_val + epsilon if min_val <= 0 else epsilon
+    self.df[col] = np.log10(self.df[col] + shift)
+    return {"shift": shift}
+
+
+@FeatureTransformer.register_inverse("log10")
+def _inv_log10(self, col, shift):
+    self.df[col] = (10 ** self.df[col]) - shift
+
+@FeatureTransformer.register_transform("standard")
+def _standard_scale(self, col):
+    mean, std = self.df[col].mean(), self.df[col].std()
+    self.df[col] = (self.df[col] - mean) / std
+    return {"mean": mean, "std": std}
+
+@FeatureTransformer.register_inverse("standard")
+def _inv_standard_scale(self, col, mean, std):
+    self.df[col] = self.df[col] * std + mean
