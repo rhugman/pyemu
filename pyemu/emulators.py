@@ -20,16 +20,26 @@ import pickle
 
 class Emulator:
     """
-    Base class for emulators. This class is not intended to be used directly.
-    Instead, use one of the subclasses: DSI, GPR, etc. #TODO
+    Base class for emulators.
+    
+    This class serves as the foundation for various emulator implementations such as
+    Data Space Inversion (DSI), Gaussian Process Regression (GPR), etc.
+    It provides common functionality and interfaces for all emulator types.
+    
+    Parameters
+    ----------
+    verbose : bool, optional
+        If True, enable verbose logging. Default is False.
     """
 
     def __init__(self,verbose=False):
         """
         Initialize the Emulator class.
 
-        Args:
+        Parameters
         ----------
+        verbose : bool, optional
+            If True, enable verbose logging. Default is False.
         """
 
         self.logger = Logger(verbose)
@@ -403,12 +413,44 @@ def _inv_standard_scale(self, col, mean, std):
 
 
 class NormalScoreTransformer:
+    """
+    A transformer for normal score transformation.
+    
+    This class implements the normal score transformation algorithm,
+    which transforms arbitrary distributions to normal distributions
+    by matching quantiles.
+    
+    Parameters
+    ----------
+    tol : float, optional
+        Convergence tolerance for the normal score estimation.
+        Default is 1e-7.
+    max_samples : int, optional
+        Maximum number of samples to use for estimating the normal distribution.
+        Default is 1,000,000.
+    """
     def __init__(self, tol=1e-7, max_samples=1000000):
         self.tol = tol
         self.max_samples = max_samples
         
 
     def randrealgen_optimized(self, nreal):
+        """
+        Generate an optimized set of normal score quantiles.
+        
+        This method implements an optimized algorithm to generate normal
+        score quantiles through Monte Carlo simulation.
+        
+        Parameters
+        ----------
+        nreal : int
+            Number of quantiles to generate.
+            
+        Returns
+        -------
+        ndarray
+            Array of normal score quantiles sorted in ascending order.
+        """
         rval = np.zeros(nreal)
         nsamp = 0
         numsort = (nreal + 1) // 2 if nreal % 2 == 0 else nreal // 2
@@ -437,7 +479,35 @@ class NormalScoreTransformer:
 
 
 @AutobotsAssemble.register_transform("normal_score")
-def _normal_score(self, col, tol=1e-7, max_samples=1000000,quadratic_extrapolation=False):
+def _normal_score(self, col, tol=1e-7, max_samples=1000000, quadratic_extrapolation=False):
+    """
+    Apply normal score transformation to a column in the DataFrame.
+    
+    This transformation maps the empirical distribution of data to a standard normal
+    distribution. The transformation is monotonic and preserves the rank order
+    of the original data.
+    
+    Parameters
+    ----------
+    col : str
+        Column name to apply the transformation to.
+    tol : float, optional
+        Tolerance for convergence of the empirical distribution. Default is 1e-7.
+    max_samples : int, optional
+        Maximum number of samples to use for estimating the empirical distribution.
+        Default is 1,000,000.
+    quadratic_extrapolation : bool, optional
+        If True, enables quadratic extrapolation for the inverse transformation.
+        Default is False.
+        
+    Returns
+    -------
+    dict
+        Parameters needed for the inverse transformation:
+        - z_scores: The standard normal quantiles
+        - originals: The original sorted values
+        - quadratic_extrapolation: Whether to use quadratic extrapolation
+    """
     x = self.df[col].values
     sorted_vals = np.sort(x)
     sorted_vals = _moving_average_with_endpoints(sorted_vals)
@@ -455,6 +525,26 @@ def _normal_score(self, col, tol=1e-7, max_samples=1000000,quadratic_extrapolati
 
 @AutobotsAssemble.register_inverse("normal_score")
 def _inv_normal_score(self, col, z_scores, originals, quadratic_extrapolation=False):
+    """
+    Inverse transform for the normal score transformation.
+    
+    Parameters
+    ----------
+    col : str
+        Column name to apply the inverse transformation to.
+    z_scores : array-like
+        The Z-scores used for the transformation.
+    originals : array-like
+        The original values corresponding to the Z-scores.
+    quadratic_extrapolation : bool, optional
+        If True, use quadratic extrapolation for values outside the range
+        of the original data. Default is False.
+        
+    Returns
+    -------
+    None
+        The transformation is applied in-place to self.df[col].
+    """
     z_scores = np.array(z_scores)
     originals = np.array(originals)
     z_vals = self.df[col]
@@ -471,20 +561,36 @@ def _inv_normal_score(self, col, z_scores, originals, quadratic_extrapolation=Fa
 
         if low_mask.any():
             coeffs_low = np.polyfit(z_scores[:3], originals[:3], deg=2)
-            if np.isscalar(interpolated):
-                interpolated = np.array([interpolated])
-            interpolated[low_mask] = np.polyval(coeffs_low, np.atleast_1d(z_vals[low_mask]))
+            interpolated = np.atleast_1d(interpolated)
+            interpolated[low_mask] = np.polyval(coeffs_low, z_vals[low_mask])
 
         if high_mask.any():
             coeffs_high = np.polyfit(z_scores[-3:], originals[-3:], deg=2)
-            if np.isscalar(interpolated):
-                interpolated = np.array([interpolated])
-            interpolated[high_mask] = np.polyval(coeffs_high, np.atleast_1d(z_vals[high_mask]))
+            interpolated = np.atleast_1d(interpolated)
+            interpolated[high_mask] = np.polyval(coeffs_high, z_vals[high_mask])
 
     self.df[col] = interpolated
 
 
 def _moving_average_with_endpoints(y_values):
+    """
+    Apply a moving average smoothing to an array while preserving endpoints.
+    
+    This function applies a sliding window average to smooth data while
+    preserving the endpoints. The window size increases with the size of
+    the input array. Uniqueness is enforced to ensure proper operation with
+    normal score transforms.
+    
+    Parameters
+    ----------
+    y_values : array-like
+        The input values to be smoothed.
+        
+    Returns
+    -------
+    smoothed_y : ndarray
+        The smoothed values with preserved endpoints and enforced uniqueness.
+    """
     # apply smoothing as per DSI2; window sizes are arbitrary...                
     window_size=3   
     if y_values.shape[0]>40:
@@ -527,11 +633,22 @@ def _moving_average_with_endpoints(y_values):
 class RowWiseMinMaxScaler:
     def __init__(self, feature_range=(-1, 1), groups=None, fit_groups=None):
         """
-        Parameters:
-        feature_range: tuple (min, max) to scale into.
-        groups: dict mapping group names to lists of column names to be scaled (the entire timeseries for that group).
-        fit_groups: dict mapping group names to lists of column names (a subset of the above) used to compute the row‐wise min and max.
-                    If not provided, defaults to groups.
+        Row-wise min-max scaler for time series or grouped data.
+        
+        This scaler normalizes data on a row-by-row basis, with separate scaling
+        for different feature groups. This is useful for time series data where
+        each row might represent a different entity with its own scale.
+        
+        Parameters
+        ----------
+        feature_range : tuple, optional
+            The range to scale features to. Default is (-1, 1).
+        groups : dict
+            Dictionary mapping group names to lists of column names to be scaled.
+            Each group will be scaled independently.
+        fit_groups : dict, optional
+            Dictionary mapping group names to lists of column names (a subset of groups)
+            used to compute the row-wise min and max. If not provided, defaults to groups.
         """
         assert isinstance(fit_groups,dict), "fit_groups must be a dictionary or None"
         assert isinstance(groups, dict), "groups must be a dictionary"
@@ -542,10 +659,38 @@ class RowWiseMinMaxScaler:
         self._row_params = {}  # will store per–row (min, max) for each group on the last transform call
 
     def fit(self, X):
+        """
+        Fit the scaler to the data.
+        
+        For row-wise scaling, nothing needs to be learned globally.
+        
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            The data to fit the scaler on.
+            
+        Returns
+        -------
+        self
+            The fitted scaler.
+        """
         # For row–wise scaling, nothing needs to be learned globally.
         return self
 
     def transform(self, X):
+        """
+        Transform the data using row-wise min-max scaling.
+        
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            The data to transform.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            The transformed data.
+        """
         # X is a pandas DataFrame.
         f_min, f_max = self.feature_range
         X_scaled = X.copy()
@@ -572,6 +717,24 @@ class RowWiseMinMaxScaler:
         return X_scaled
 
     def inverse_transform(self, X_scaled):
+        """
+        Inverse transform the scaled data back to the original scale.
+        
+        Parameters
+        ----------
+        X_scaled : pandas.DataFrame
+            The scaled data to inverse transform.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            The inverse transformed data in the original scale.
+            
+        Raises
+        ------
+        ValueError
+            If transform hasn't been called previously to store the row parameters.
+        """
         f_min, f_max = self.feature_range
         X_orig = X_scaled.copy()
         if not self._row_params:
@@ -589,4 +752,4 @@ class RowWiseMinMaxScaler:
             X_orig[group_cols] = group_std.mul(row_range, axis=0).add(row_min, axis=0)
             
         return X_orig
-    
+
