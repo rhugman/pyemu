@@ -14,6 +14,9 @@ from .logger import Logger
 #from sklearn.decomposition import PCA
 #from sklearn.preprocessing import StandardScaler
 #from scipy.stats import norm
+import inspect
+from pyemu.utils.helpers import dsi_forward_run
+import pickle
 
 class Emulator:
     """
@@ -75,9 +78,11 @@ class Emulator:
             self.logger = Logger(verbose)
             self.log = self.logger.log
 
-            self.pst = pst
-            self.__org_sim_ensemble = sim_ensemble
-            self.data = sim_ensemble
+            self.__org_observation_data = pst.observation_data.copy()
+            self.__org_parameter_data = pst.parameter_data.copy()
+            #self.__org_control_data = pst.control_data.copy() #breaks pickling
+            self.__org_sim_ensemble = sim_ensemble._df.copy()
+            self.data = sim_ensemble._df.copy()
             self.data_transformed = None
             self.feature_scaler = None
             self.energy_threshold = energy_threshold
@@ -86,6 +91,7 @@ class Emulator:
             else:
                 self.log_transform = log_transform
             assert isinstance(self.log_transform, (bool, list)), "log_transform must be a boolean or a list of column names"
+            self.normal_score_transform = normal_score_transform
             self.nst_extrapolate=nst_extrapolate
             
             
@@ -175,20 +181,19 @@ class Emulator:
         
 
 
-        def forward_run(self,pvals):
-           
+        def predict(self,pvals):
+            if isinstance(pvals, pd.Series):
+                pvals = pvals.values.flatten()
+            assert pvals.shape[0] == self.s.shape[0], "pvals must be the same length as the number of singular values"
+            assert pvals.shape[0] == self.pmat.shape[1], "pvals must be the same length as the number of singular values"
             pmat = self.pmat
             ovals = self.ovals
-
             sim_vals = ovals + np.dot(pmat,pvals)
-
-            # inverse transforms...
-            
             ft = self.feature_transformer
             sim_vals = ft.inverse_on_external_df(sim_vals, columns=self.data_transformed.columns.tolist())
-
+            sim_vals.index.name = 'obsnme'
+            sim_vals.name = "obsval"
             self.sim_vals = sim_vals
-
             return sim_vals
         
         def check_for_pdc():
@@ -196,7 +201,99 @@ class Emulator:
             return
             
 
+        def prepare_pestpp(self,t_d=None):
 
+            if os.path.exists(t_d):
+                shutil.rmtree(t_d)
+            os.makedirs(t_d)
+            self.logger.statement("creating template directory {0}".format(t_d))
+
+            self.logger.log("creating tpl files")
+            dsi_in_file = os.path.join(t_d, "dsi_pars.csv")
+            dsi_tpl_file = dsi_in_file + ".tpl"
+            ftpl = open(dsi_tpl_file, 'w')
+            fin = open(dsi_in_file, 'w')
+            ftpl.write("ptf ~\n")
+            fin.write("parnme,parval1\n")
+            ftpl.write("parnme,parval1\n")
+            npar = self.s.shape[0]
+            assert npar>0, "no parameters found in the DSI emulator"
+            dsi_pnames = []
+            for i in range(npar):
+                pname = "dsi_par{0:04d}".format(i)
+                dsi_pnames.append(pname)
+                fin.write("{0},0.0\n".format(pname))
+                ftpl.write("{0},~   {0}   ~\n".format(pname, pname))
+            fin.close()
+            ftpl.close()
+            self.logger.log("creating tpl files")
+
+            # run once to get the dsi_pars.csv file
+            pvals = np.zeros_like(self.s)
+            sim_vals = self.predict(pvals)
+            
+            self.logger.log("creating ins file")
+            out_file = os.path.join(t_d,"dsi_sim_vals.csv")
+            sim_vals.to_csv(out_file,index=True)
+                  
+            ins_file = out_file + ".ins"
+            sdf = pd.read_csv(out_file,index_col=0)
+            with open(ins_file,'w') as f:
+                f.write("pif ~\n")
+                f.write("l1\n")
+                for oname in sdf.index.values:
+                    f.write("l1 ~,~ !{0}!\n".format(oname))
+            self.logger.log("creating ins file")
+
+            self.logger.log("creating Pst")
+            pst = Pst.from_io_files([dsi_tpl_file],[dsi_in_file],[ins_file],[out_file],pst_path=".")
+
+            par = pst.parameter_data
+            dsi_pars = par.loc[par.parnme.str.startswith("dsi_par"),"parnme"]
+            par.loc[dsi_pars,"parval1"] = 0
+            par.loc[dsi_pars,"parubnd"] = 10.0
+            par.loc[dsi_pars,"parlbnd"] = -10.0
+            par.loc[dsi_pars,"partrans"] = "none"
+            with open(os.path.join(t_d,"dsi.unc"),'w') as f:
+                f.write("START STANDARD_DEVIATION\n")
+                for p in dsi_pars:
+                    f.write("{0} 1.0\n".format(p))
+                f.write("END STANDARD_DEVIATION")
+            pst.pestpp_options['parcov'] = "dsi.unc"
+
+
+            obs = pst.observation_data
+            org_obs = self.__org_observation_data
+            for col in org_obs.columns:
+                obs.loc[sim_vals.index,col] = org_obs.loc[:,col]
+            pst.control_data.noptmax = 0
+            pst.model_command = "python forward_run.py"
+            self.logger.log("creating Pst")
+
+
+            function_source = inspect.getsource(dsi_forward_run)
+            with open(os.path.join(t_d,"forward_run.py"),'w') as file:
+                file.write(function_source)
+                file.write("\n\n")
+                file.write("if __name__ == \"__main__\":\n")
+                file.write(f"    {function_source.split("(")[0].split("def ")[1]}()\n")
+            self.logger.log("creating Pst")
+
+            pst.pestpp_options["overdue_giveup_fac"] = 1e30
+            pst.pestpp_options["overdue_giveup_minutes"] = 1e30
+            pst.pestpp_options["panther_agent_freeze_on_fail"] = True
+            pst.pestpp_options["ies_no_noise"] = False
+            pst.pestpp_options["ies_subset_size"] = -10 # the more the merrier
+            #pst.pestpp_options["ies_bad_phi_sigma"] = 2.0
+            #pst.pestpp_options["save_binary"] = True
+
+            pst.write(os.path.join(t_d,"dsi.pst"),version=2)
+            self.logger.statement("saved pst to {0}".format(os.path.join(t_d,"dsi.pst")))
+            
+            #self.pst_dsi = pst #breaks pickling #TODO: add save/load methods to Emulator class
+            with open(os.path.join(t_d,"dsi.pickle"),"wb") as f:
+                pickle.dump(self,f)
+            return pst
 
 
 
@@ -364,6 +461,9 @@ def _inv_normal_score(self, col, z_scores, originals, quadratic_extrapolation=Fa
     if isinstance(z_vals, pd.Series):
         z_vals = z_vals.values
     interpolated = np.interp(z_vals, z_scores, originals)
+    assert np.all(np.isfinite(interpolated)), "Interpolation resulted in NaN values"
+    assert np.all(np.isfinite(z_vals)), "Input values contain NaN values"
+    assert interpolated.shape == z_vals.shape, "Interpolated values do not match input shape"
 
     if quadratic_extrapolation:
         low_mask = z_vals < z_scores.min()
@@ -371,11 +471,15 @@ def _inv_normal_score(self, col, z_scores, originals, quadratic_extrapolation=Fa
 
         if low_mask.any():
             coeffs_low = np.polyfit(z_scores[:3], originals[:3], deg=2)
-            interpolated[low_mask] = np.polyval(coeffs_low, z_vals[low_mask])
+            if np.isscalar(interpolated):
+                interpolated = np.array([interpolated])
+            interpolated[low_mask] = np.polyval(coeffs_low, np.atleast_1d(z_vals[low_mask]))
 
         if high_mask.any():
             coeffs_high = np.polyfit(z_scores[-3:], originals[-3:], deg=2)
-            interpolated[high_mask] = np.polyval(coeffs_high, z_vals[high_mask])
+            if np.isscalar(interpolated):
+                interpolated = np.array([interpolated])
+            interpolated[high_mask] = np.polyval(coeffs_high, np.atleast_1d(z_vals[high_mask]))
 
     self.df[col] = interpolated
 
@@ -485,3 +589,4 @@ class RowWiseMinMaxScaler:
             X_orig[group_cols] = group_std.mul(row_range, axis=0).add(row_min, axis=0)
             
         return X_orig
+    

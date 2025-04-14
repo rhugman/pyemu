@@ -4417,82 +4417,25 @@ def gpr_forward_run():
     return mdf
 
 
-def dsi_forward_run(pmat=None,ovals=None,pvals=None,
-                    write_csv=True
-                    
-                    ):
-
-    if pvals is None:
-        pvals = pd.read_csv("dsi_pars.csv",index_col=0)
-    if pmat is None:
-        pmat = np.load("dsi_proj_mat.npy")
-    if ovals is None:
-        ovals = pd.read_csv("dsi_pr_mean.csv",index_col=0)
-
-    try:
-        offset = np.load("dsi_obs_offset.npy")
-    except:
-        #print("no offset file found, assuming no offset")
-        offset = np.zeros(ovals.shape[0])
-    try:
-        log_trans = np.load("dsi_obs_log.npy")
-    except:
-        #print("no log-tansform file found, assuming no log-transform")
-        log_trans = np.zeros(ovals.shape[0])
-
-    try:
-        backtransformvals = np.load("dsi_obs_backtransformvals.npy")
-        backtransformobsnmes = np.load("dsi_obs_backtransformobsnmes.npy",allow_pickle=True)
-        backtransform=True
-    except:
-        #print("no back-transform file found, assuming no back-transform")
-        backtransform=False
-
-
-    sim_vals = ovals + np.dot(pmat,pvals.values)
-
-    if backtransform:
-        #print("applying back-transform")
-        obsnmes = np.unique(backtransformobsnmes)
-        back_vals = [
-                    inverse_normal_score_transform(
-                                        backtransformvals[np.where(backtransformobsnmes==o)][:,1],
-                                        backtransformvals[np.where(backtransformobsnmes==o)][:,0],
-                                        sim_vals.loc[o].mn,
-                                        extrap=None
-                                        )[0] 
-                    for o in obsnmes
-                    ]     
-        sim_vals.loc[obsnmes,'mn'] = back_vals
-
-    #print("reversing offset and log-transform")
-    assert log_trans.shape[0] == sim_vals.mn.values.shape[0], f"log transform shape mismatch: {log_trans.shape[0]},{sim_vals.mn.values.shape[0]}"
-    assert offset.shape[0] == sim_vals.mn.values.shape[0], f"offset transform shape mismatch: {offset.shape[0]},{sim_vals.mn.values.shape[0]}"
-    vals = sim_vals.mn.values
-    vals[np.where(log_trans==1)] = 10**vals[np.where(log_trans==1)]
-    vals-= offset
-    sim_vals.loc[:,'mn'] = vals
-    #print(sim_vals)
+def dsi_forward_run(pvals,dsi,write_csv=False):
+    assert isinstance(dsi,pyemu.emulators.Emulator.DSI), "dsi must be a pyemu DSI object" 
+    if isinstance(pvals,pd.DataFrame):
+        pvals = pvals.parval1
+    sim_vals = dsi.predict(pvals)
     if write_csv:
         sim_vals.to_csv("dsi_sim_vals.csv")
     return sim_vals
 
 
-def dsi_pyworker(pst,host,port,pmat=None,ovals=None,pvals=None):
+def dsi_pyworker(pst,host,port,dsi=None,pvals=None):
     
-    import os
     import pandas as pd
-    import numpy as np
-
-
     # if explicit args weren't passed, get the default ones...
     if pvals is None:
         pvals = pd.read_csv("dsi_pars.csv",index_col=0)
-    if pmat is None:
-        pmat = np.load("dsi_proj_mat.npy")
-    if ovals is None:
-        ovals = pd.read_csv("dsi_pr_mean.csv",index_col=0)
-
+    if dsi is None:
+        import pickle
+        dsi = pickle.load(open("dsi.pickle","rb"))
 
     ppw = PyPestWorker(pst,host,port,verbose=False)
 
@@ -4513,10 +4456,10 @@ def dsi_pyworker(pst,host,port,pmat=None,ovals=None,pvals=None):
         # df needed to run the emulator
         pvals.parval1 = parameters.loc[pvals.index]
         # do the emulation
-        simdf = dsi_forward_run(pmat=pmat,ovals=ovals,pvals=pvals,write_csv=False)
+        simdf = dsi_forward_run(dsi=dsi,pvals=pvals,write_csv=False)
 
         # replace the emulated quantities in the obs series
-        obs.loc[simdf.index] = simdf.mn.values
+        obs.loc[simdf.index] = simdf.values
 
         #send the obs series to the master
         ppw.send_observations(obs.values)
