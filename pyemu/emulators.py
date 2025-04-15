@@ -91,8 +91,10 @@ class Emulator:
             self.__org_observation_data = pst.observation_data.copy()
             self.__org_parameter_data = pst.parameter_data.copy()
             #self.__org_control_data = pst.control_data.copy() #breaks pickling
-            self.__org_sim_ensemble = sim_ensemble._df.copy()
-            self.data = sim_ensemble._df.copy()
+            if isinstance(sim_ensemble, ObservationEnsemble):
+                sim_ensemble = sim_ensemble._df.copy()
+            self.__org_sim_ensemble = sim_ensemble.copy()
+            self.data = sim_ensemble.copy()
             self.data_transformed = None
             self.feature_scaler = None
             self.energy_threshold = energy_threshold
@@ -211,7 +213,7 @@ class Emulator:
             return
             
 
-        def prepare_pestpp(self,t_d=None):
+        def prepare_pestpp(self,t_d=None,observation_data=None):
 
             if os.path.exists(t_d):
                 shutil.rmtree(t_d)
@@ -271,11 +273,18 @@ class Emulator:
                 f.write("END STANDARD_DEVIATION")
             pst.pestpp_options['parcov'] = "dsi.unc"
 
-
             obs = pst.observation_data
-            org_obs = self.__org_observation_data
-            for col in org_obs.columns:
-                obs.loc[sim_vals.index,col] = org_obs.loc[:,col]
+
+            if observation_data is None:
+                observation_data = self.__org_observation_data
+            assert isinstance(observation_data, pd.DataFrame), "observation_data must be a pandas DataFrame"
+            for col in observation_data.columns:
+                obs.loc[sim_vals.index,col] = observation_data.loc[:,col]
+
+            # check if any observations are missing
+            missing_obs = list(set(obs.index) - set(observation_data.index))
+            assert len(missing_obs) == 0, "missing observations: {0}".format(missing_obs)
+
             pst.control_data.noptmax = 0
             pst.model_command = "python forward_run.py"
             self.logger.log("creating Pst")
