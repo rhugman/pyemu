@@ -4426,6 +4426,119 @@ def dsi_forward_run(pvals,dsi,write_csv=False):
         sim_vals.to_csv("dsi_sim_vals.csv")
     return sim_vals
 
+def dsivc_forward_run(md_ies="."):
+    import pandas as pd
+    import pyemu
+    import os
+    import socket
+    import pickle
+    try:
+        os.remove("dsi.noise.csv")
+    except:
+        print("dsi.noise.csv not found, continuing...")
+    try:
+        os.remove("dsi.stack.csv")
+    except:
+        print("dsi.stack.csv not found, continuing...")
+    try:
+        os.remove("dsi.stack_stats.csv")
+    except:
+        print("dsi.stack_stats.csv not found, continuing...")
+    try:
+        os.remove("dsi.3.obs.csv")
+    except:
+        print("dsi.3.obs.csv not found, continuing...")
+
+
+    def is_port_free(port, host='127.0.0.1'):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.1)
+            try:
+                s.bind((host, port))
+                return True
+            except OSError:
+                return False
+
+    def find_free_ports(n, start_port=4005, end_port=60000, host='127.0.0.1'):
+        free_ports = []
+        for port in range(start_port, end_port):
+            if is_port_free(port, host):
+                free_ports.append(port)
+                if len(free_ports) == n:
+                    break
+        return free_ports
+
+    # load decvars
+    decvars = pd.read_csv(os.path.join(md_ies, "dsivc_pars.csv"),index_col=0)
+    assert decvars.shape[0]>0, "no decvars found in dsivc_pars.csv"
+
+    # load the dsi pest control file
+    pst_dsi = pyemu.Pst(os.path.join(md_ies,"dsi.pst"))
+
+    # update the decavar obs values in the observation data
+    obs = pst_dsi.observation_data
+    assert obs.loc[decvars.index].shape[0] == decvars.shape[0], "not all decvars found in obs data"
+    assert all(obs.loc[decvars.index].weight > 0.0), "decvar weights should be > 0.0"
+    obs.loc[decvars.index,"obsval"] = decvars.values
+
+    # update the obs+noise file with the decvar values to ensure NO NOISE on the decvars
+    noise = pyemu.ObservationEnsemble.from_csv(pst_dsi,os.path.join(md_ies,"dsi.obs+noise.csv"))._df
+    # check that all of decvars.index are in noise.columns
+    assert len([i for i in decvars.index if i not in noise.columns.tolist()]) == 0, "some decvars not in noise columns"
+    # update columns in noise if column name in decvars.index
+    for col in decvars.index:
+        noise[col] = noise[col].astype(float)
+        noise.loc[:,col] = decvars.loc[col].values[0]
+    # record noise 
+    noise.to_csv(os.path.join(md_ies,"dsi.noise.csv"))
+    # make sure pestpp options 
+    pst_dsi.pestpp_options["ies_observation_ensemble"] = "dsi.noise.csv"
+    # rewrite the dsi.pst file 
+    pst_dsi.write(os.path.join(md_ies,"dsi.pst"))
+
+    # deploy dsi...
+    pvals = pd.read_csv(os.path.join(md_ies,"dsi_pars.csv"),index_col=0)
+    num_workers=1
+    worker_root="."
+    dsi = pickle.load(open(os.path.join(md_ies,"dsi.pickle"),"rb"))
+    pyemu.os_utils.start_workers(md_ies,"pestpp-ies","dsi.pst",
+                                num_workers=num_workers,
+                                worker_root=worker_root,
+                                port = find_free_ports(1)[0],
+                                    master_dir=md_ies,
+                                    reuse_master =True,
+                                    ppw_function=pyemu.helpers.dsi_pyworker,
+                                    ppw_kwargs={"dsi":dsi,"pvals":pvals})    
+    assert os.path.exists(os.path.join(md_ies,"dsi.3.obs.csv")), "dsi.3.obs.csv not found...pst failed?"
+
+
+    #TODO: checks on PDC or Eulerian distance to training data?
+
+
+    #postprocess stack
+    oe = pyemu.ObservationEnsemble.from_csv(pst_dsi,os.path.join(md_ies,"dsi.3.obs.csv"))
+    assert oe.shape[0] == noise.shape[0], "stack and noise shapes do not match; failed runs?"
+    # write long form oe
+    stack = oe._df.reset_index().melt(id_vars="real_name")
+    stack.rename(columns={"value":"obsval"},inplace=True)
+    stack['obsnme'] = stack.apply(lambda x: x.variable+"_real:"+x.real_name,axis=1)
+    stack.set_index("obsnme",inplace=True)
+    stack = stack.obsval
+    out_file = os.path.join(md_ies,"dsi.stack.csv")
+    stack.to_csv(out_file,float_format="%.6e")
+    #write stats
+
+    #TODO: add user-specified quantiles
+    
+    stack_stats = oe._df.describe(percentiles=[0.25,0.75,0.5]).reset_index().melt(id_vars="index")
+    stack_stats.rename(columns={"value":"obsval","index":"stat"},inplace=True)
+    stack_stats['obsnme'] = stack_stats.apply(lambda x: x.variable+"_stat:"+x.stat,axis=1)
+    stack_stats.set_index("obsnme",inplace=True)
+    stack_stats = stack_stats.obsval
+    out_file = os.path.join(md_ies,"dsi.stack_stats.csv")
+    stack_stats.to_csv(out_file,float_format="%.6e")
+
+    return
 
 def dsi_pyworker(pst,host,port,dsi=None,pvals=None):
     
