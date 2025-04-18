@@ -477,7 +477,7 @@ class Emulator:
             if mou_population_size < 2 * len(decvar_names):
                 self.logger.statement(f"mou population is less than 2x number of decision variables, this may be too small...")
             # sample 160 sets of decision variables from a unform distribution
-            dvpop = ParameterEnsemble.from_uniform_draw(pst,num_reals=mou_population_size)
+            dvpop = ParameterEnsemble.from_uniform_draw(pst_dsivc,num_reals=mou_population_size)
             # record to external file for PESTPP-MOU
             dvpop.to_binary(os.path.join(t_d,"initial_dvpop.jcb"))
             # tell PESTPP-MOU about the new file
