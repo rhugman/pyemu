@@ -355,13 +355,13 @@ class Emulator:
                 assert isinstance(oe, ObservationEnsemble), "oe must be an ObservationEnsemble"
 
             #check if decvar_names str
-            if isinstance(decvars, str):
-                decvars = [decvars]
+            if isinstance(decvar_names, str):
+                decvar_names = [decvar_names]
             # chekc htat decvars are in the oe columns
-            missing = [col for col in decvars if col not in oe.columns]
+            missing = [col for col in decvar_names if col not in oe.columns]
             assert len(missing) == 0, f"The following decvars are missing from the DSI obs ensemble: {missing}"
             # chekc htat decvars are in the pst observation data
-            missing = [col for col in decvars if col not in pst.obs_names]
+            missing = [col for col in decvar_names if col not in pst.obs_names]
             assert len(missing) == 0, f"The following decvars are missing from the DSI pst control file: {missing}"
 
 
