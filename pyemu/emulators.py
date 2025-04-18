@@ -336,19 +336,19 @@ class Emulator:
                                }
 
             if t_d is None:
-                self.logger.warning("using existing DSI template dir...")
+                self.logger.statement("using existing DSI template dir...")
                 t_d = self.template_dir
             self.logger.statement(f"using {t_d} as template directory...")
             assert os.path.exists(t_d), f"template directory {t_d} does not exist"
 
             if pst is None:
                 self.logger.statement("no pst provided...")
-                self.logger.warning("using dsi.pst in DSI template dir...")
+                self.logger.statement("using dsi.pst in DSI template dir...")
                 assert os.path.exists(os.path.join(t_d,"dsi.pst")), f"dsi.pst not found in {t_d}"
                 pst = Pst(os.path.join(t_d,"dsi.pst"))
             if oe is None:
                 self.logger.statement("no posterior DSI observation ensemble provided, using dsi.3.obs.jcb in DSI template dir...")
-                self.logger.warning(f"using dsi.{dsi_args['noptmax']}.obs.jcb in DSI template dir...")
+                self.logger.statement(f"using dsi.{dsi_args['noptmax']}.obs.jcb in DSI template dir...")
                 assert os.path.exists(os.path.join(t_d,f"dsi.{dsi_args['noptmax']}.obs.jcb")), f"dsi.{dsi_args['noptmax']}.obs.jcb not found in {t_d}"
                 oe = ObservationEnsemble.from_binary(pst,os.path.join(t_d,f"dsi.{dsi_args['noptmax']}.obs.jcb"))
             else:
@@ -475,7 +475,7 @@ class Emulator:
                 mou_population_size = 2 * len(decvar_names)
             # these should generally be twice the number of decision variables
             if mou_population_size < 2 * len(decvar_names):
-                self.logger.warning(f"mou population is less than 2x number of decision variables, this may be too small...")
+                self.logger.statement(f"mou population is less than 2x number of decision variables, this may be too small...")
             # sample 160 sets of decision variables from a unform distribution
             dvpop = ParameterEnsemble.from_uniform_draw(pst,num_reals=mou_population_size)
             # record to external file for PESTPP-MOU
@@ -493,18 +493,18 @@ class Emulator:
 
             # updating the DSI pst control file
             self.logger.statement(f"updating DSI pst control file...")
-            self.logger.warning("overwriting dsi.pst file...")
+            self.logger.statement("overwriting dsi.pst file...")
             pst.observation_data.loc[decvar_names, "weight"] = dsi_args["decvar_weight"]
             pst.control_data.noptmax = dsi_args["noptmax"]
             pst.write(os.path.join(t_d,"dsi.pst"), version=2)
             
             
-            self.logger.warning("overwriting dsi.pickle file...")
+            self.logger.statement("overwriting dsi.pickle file...")
             # re-pickle dsi to track dsivc args
             with open(os.path.join(t_d,"dsi.pickle"),"wb") as f:
                 pickle.dump(self,f)
 
-            self.logger.warning("DSIVC control files created...the user still needs to specify objectives...")
+            self.logger.statement("DSIVC control files created...the user still needs to specify objectives...")
             return pst_dsivc
 
 
