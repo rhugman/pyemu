@@ -4486,6 +4486,7 @@ def dsivc_forward_run(md_ies="."):
     num_workers=1
     worker_root="."
     dsi = pickle.load(open(os.path.join(md_ies,"dsi.pickle"),"rb"))
+    num_workers = dsi.dsivc_args.get("num_pyworkers",1)
     pyemu.os_utils.start_workers(md_ies,"pestpp-ies","dsi.pst",
                                 num_workers=num_workers,
                                 worker_root=worker_root,
@@ -4502,7 +4503,7 @@ def dsivc_forward_run(md_ies="."):
     #postprocess stack
     oe = pyemu.ObservationEnsemble.from_binary(pst_dsi,os.path.join(md_ies,f"dsi.{noptmax}.obs.jcb"))
     assert oe.shape[0] == noise.shape[0], "stack and noise shapes do not match; failed runs?"
-    if dsi.dsivc_arg.get("track_stack",False):
+    if dsi.dsivc_args.get("track_stack",False):
         # write long form oe
         stack = oe._df.reset_index().melt(id_vars="real_name")
         stack.rename(columns={"value":"obsval"},inplace=True)
@@ -4513,7 +4514,7 @@ def dsivc_forward_run(md_ies="."):
         stack.to_csv(out_file,float_format="%.6e")
     #write stats
     #get user-specified quantiles
-    percentiles = self.dsivc_args.get("percentiles",[0.25,0.75,0.5])
+    percentiles = dsi.dsivc_args.get("percentiles",[0.25,0.75,0.5])
     stack_stats = oe._df.describe(percentiles=percentiles).reset_index().melt(id_vars="index")
     stack_stats.rename(columns={"value":"obsval","index":"stat"},inplace=True)
     stack_stats['obsnme'] = stack_stats.apply(lambda x: x.variable+"_stat:"+x.stat,axis=1)
