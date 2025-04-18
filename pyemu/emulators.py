@@ -7,7 +7,7 @@ import warnings
 from .pyemu_warnings import PyemuWarning
 import numpy as np
 import pandas as pd
-from pyemu.en import ObservationEnsemble
+from pyemu.en import ObservationEnsemble,ParameterEnsemble
 from pyemu.mat.mat_handler import Matrix, Jco, Cov
 from pyemu.pst.pst_handler import Pst
 from .logger import Logger
@@ -15,7 +15,7 @@ from .logger import Logger
 #from sklearn.preprocessing import StandardScaler
 #from scipy.stats import norm
 import inspect
-from pyemu.utils.helpers import dsi_forward_run
+from pyemu.utils.helpers import dsi_forward_run, series_to_insfile
 import pickle
 
 class Emulator:
@@ -214,6 +214,9 @@ class Emulator:
             
 
         def prepare_pestpp(self,t_d=None,observation_data=None):
+            
+            assert t_d is not None, "template directory must be provided"
+            self.template_dir = t_d
 
             if os.path.exists(t_d):
                 shutil.rmtree(t_d)
@@ -298,6 +301,7 @@ class Emulator:
                 file.write(f"    {function_source.split("(")[0].split("def ")[1]}()\n")
             self.logger.log("creating Pst")
 
+            pst.pestpp_options["save_binary"] = True
             pst.pestpp_options["overdue_giveup_fac"] = 1e30
             pst.pestpp_options["overdue_giveup_minutes"] = 1e30
             pst.pestpp_options["panther_agent_freeze_on_fail"] = True
@@ -314,7 +318,194 @@ class Emulator:
                 pickle.dump(self,f)
             return pst
 
+        def prepare_dsivc(self,decvar_names,t_d=None,pst=None,oe=None,track_stack=False,dsi_args=None,percentiles=[0.25,0.75,0.5],mou_population_size=None):
 
+    
+            # check that percentiles is a list or array of floats between 0 and 1.
+            assert isinstance(percentiles, (list, np.ndarray)), "percentiles must be a list or array of floats"
+            assert all([isinstance(i, (float, int)) for i in percentiles]), "percentiles must be a list or array of floats"
+            assert all([0 <= i <= 1 for i in percentiles]), "percentiles must be between 0 and 1"
+            # ensure that pecentiles are unique
+            percentiles = np.unique(percentiles)
+
+
+            #track dsivc args for forward run
+            self.dsivc_args = {"percentiles":percentiles,
+                               "decvar_names":decvar_names,
+                                 "track_stack":track_stack,
+                               }
+
+            if t_d is None:
+                self.logger.warning("using existing DSI template dir...")
+                t_d = self.template_dir
+            self.logger.statement(f"using {t_d} as template directory...")
+            assert os.path.exists(t_d), f"template directory {t_d} does not exist"
+
+            if pst is None:
+                self.logger.statement("no pst provided...")
+                self.logger.warning("using dsi.pst in DSI template dir...")
+                assert os.path.exists(os.path.join(t_d,"dsi.pst")), f"dsi.pst not found in {t_d}"
+                pst = Pst(os.path.join(t_d,"dsi.pst"))
+            if oe is None:
+                self.logger.statement("no posterior DSI observation ensemble provided, using dsi.3.obs.jcb in DSI template dir...")
+                self.logger.warning(f"using dsi.{dsi_args['noptmax']}.obs.jcb in DSI template dir...")
+                assert os.path.exists(os.path.join(t_d,f"dsi.{dsi_args['noptmax']}.obs.jcb")), f"dsi.{dsi_args['noptmax']}.obs.jcb not found in {t_d}"
+                oe = ObservationEnsemble.from_binary(pst,os.path.join(t_d,f"dsi.{dsi_args['noptmax']}.obs.jcb"))
+            else:
+                assert isinstance(oe, ObservationEnsemble), "oe must be an ObservationEnsemble"
+
+            #check if decvar_names str
+            if isinstance(decvars, str):
+                decvars = [decvars]
+            # chekc htat decvars are in the oe columns
+            missing = [col for col in decvars if col not in oe.columns]
+            assert len(missing) == 0, f"The following decvars are missing from the DSI obs ensemble: {missing}"
+            # chekc htat decvars are in the pst observation data
+            missing = [col for col in decvars if col not in pst.obs_names]
+            assert len(missing) == 0, f"The following decvars are missing from the DSI pst control file: {missing}"
+
+
+            # handle DSI args
+            default_dsi_args =  {"noptmax":pst.control_data.noptmax,
+                                "decvar_weight":1.0,
+                                #"decvar_phi_factor":0.5,
+                                }
+            # ensure it's a dict
+            if dsi_args is None:
+                dsi_args = {}
+            elif not isinstance(dsi_args, dict):
+                raise TypeError("Expected a dictionary for 'options'")
+            # merge with defaults (user values override defaults)
+            dsi_args = {**default_dsi_args, **dsi_args}
+
+
+
+            out_files = []
+
+            self.logger.statement(f"preparing stack stats observations...")
+            assert isinstance(oe, ObservationEnsemble), "oe must be an ObservationEnsemble"
+            if oe.index.name is None:
+                id_vars="index"
+            else:
+                id_vars=oe.index.name
+            stack_stats = oe._df.describe(percentiles=percentiles).reset_index().melt(id_vars=id_vars)
+            stack_stats.rename(columns={"value":"obsval","index":"stat"},inplace=True)
+            stack_stats['obsnme'] = stack_stats.apply(lambda x: x.variable+"_stat:"+x.stat,axis=1)
+            stack_stats.set_index("obsnme",inplace=True)
+            stack_stats = stack_stats.obsval
+            self.logger.statement(f"stack osb recorded to dsi.stack_stats.csv...")
+            out_file = os.path.join(t_d,"dsi.stack_stats.csv")
+            out_files.append(out_file)
+            stack_stats.to_csv(out_file,float_format="%.6e")
+            series_to_insfile(out_file,ins_file=None)
+
+
+            if track_stack:
+                self.logger.statement(f"including {oe.values.flatten().shape[0]} stack observations...")
+
+                stack = oe._df.reset_index().melt(id_vars=id_vars)
+                stack.rename(columns={"value":"obsval"},inplace=True)
+                stack['obsnme'] = stack.apply(lambda x: x.variable+"_real:"+x.index,axis=1)
+                stack.set_index("obsnme",inplace=True)
+                stack = stack.obsval
+                out_file = os.path.join(t_d,"dsi.stack.csv")
+                out_files.append(out_file)
+                stack.to_csv(out_file,float_format="%.6e")
+                series_to_insfile(out_file,ins_file=None)
+
+
+
+            self.logger.statement(f"prepare DSIVC template files...")
+            dsi_in_file = os.path.join(t_d, "dsivc_pars.csv")
+            dsi_tpl_file = dsi_in_file + ".tpl"
+            ftpl = open(dsi_tpl_file, 'w')
+            fin = open(dsi_in_file, 'w')
+            ftpl.write("ptf ~\n")
+            fin.write("parnme,parval1\n")
+            ftpl.write("parnme,parval1\n")
+            for pname in decvar_names:
+                val = oe._df.loc[:,pname].mean()
+                fin.write(f"{pname},{val:.6e}\n")
+                ftpl.write(f"{pname},~   {pname}   ~\n")
+            fin.close()
+            ftpl.close()
+
+            
+            self.logger.statement(f"building DSIVC control file...")
+            pst_dsivc = Pst.from_io_files([dsi_tpl_file],[dsi_in_file],[i+".ins" for i in out_files],out_files,pst_path=".")
+
+            self.logger.statement(f"setting dec var bounds...")
+            par = pst_dsivc.parameter_data
+            # set all parameters fixed
+            par.loc[:,"partrans"] = "fixed"
+            # constrain decvar pars to training data bounds
+            par.loc[decvar_names,"pargp"] = "decvars"
+            par.loc[decvar_names,"partrans"] = "none"
+            par.loc[decvar_names,"parubnd"] = self.data.loc[:,decvar_names].max()
+            par.loc[decvar_names,"parlbnd"] = self.data.loc[:,decvar_names].min()
+            
+            self.logger.statement(f"zero-weighting observation data...")
+            # prepemtpively set obs weights 0.0
+            obs = pst_dsivc.observation_data
+            obs.loc[:,"weight"] = 0.0
+
+            self.logger.statement(f"getting obs metadata from DSI observation_data...")
+            obsorg = pst.observation_data.copy()
+            columns = [i for i in obsorg.columns if i !='obsnme']
+            for o in obsorg.obsnme.values:
+                obs.loc[obs.obsnme.str.startswith(o), columns] = obsorg.loc[obsorg.obsnme==o, columns].values
+
+            obs.loc[stack_stats.index,"obgnme"] = "stack_stats"
+            #obs.loc[stack.index,"obgnme"] = "stack"
+
+            self.logger.statement(f"building dsivc_forward_run.py...")
+            pst_dsivc.model_command = "python dsivc_forward_run.py"
+            from pyemu.utils.helpers import dsivc_forward_run
+            function_source = inspect.getsource(dsivc_forward_run)
+            with open(os.path.join(t_d,"dsivc_forward_run.py"),'w') as file:
+                file.write(function_source)
+                file.write("\n\n")
+                file.write("if __name__ == \"__main__\":\n")
+                file.write(f"    {function_source.split("(")[0].split("def ")[1]}()\n")
+
+            self.logger.statement(f"preparing nominal initial population...")
+            if mou_population_size is None:
+                # set the population size to 2 * number of decision variables
+                # this is a good rule of thumb for MOU
+                mou_population_size = 2 * len(decvar_names)
+            # these should generally be twice the number of decision variables
+            if mou_population_size < 2 * len(decvar_names):
+                self.logger.warning(f"mou population is less than 2x number of decision variables, this may be too small...")
+            # sample 160 sets of decision variables from a unform distribution
+            dvpop = ParameterEnsemble.from_uniform_draw(pst,num_reals=mou_population_size)
+            # record to external file for PESTPP-MOU
+            dvpop.to_binary(os.path.join(t_d,"initial_dvpop.jcb"))
+            # tell PESTPP-MOU about the new file
+            pst_dsivc.pestpp_options["mou_dv_population_file"] = 'initial_dvpop.jcb'
+
+
+            # some additional PESTPP-MOU options:
+            pst_dsivc.pestpp_options["mou_population_size"] = mou_population_size #twice the number of decision variables
+            pst_dsivc.pestpp_options["mou_save_population_every"] = 1 # save lots of files! 
+            
+            pst_dsivc.control_data.noptmax = 0 #just for a test run
+            pst_dsivc.write(os.path.join(t_d,"dsivc.pst"),version=2)  
+
+            # updating the DSI pst control file
+            self.logger.statement(f"updating DSI pst control file...")
+            self.logger.warning("overwriting dsi.pst file...")
+            pst.observation_data.loc[decvar_names, "weight"] = dsi_args["decvar_weight"]
+            pst.control_data.noptmax = dsi_args["noptmax"]
+            pst.write(os.path.join(t_d,"dsi.pst"), version=2)
+            
+            
+            self.logger.warning("overwriting dsi.pickle file...")
+            # re-pickle dsi to track dsivc args
+            with open(os.path.join(t_d,"dsi.pickle"),"wb") as f:
+                pickle.dump(self,f)
+
+            self.logger.warning("DSIVC control files created...the user still needs to specify objectives...")
+            return pst_dsivc
 
 
 class AutobotsAssemble:
@@ -761,4 +952,8 @@ class RowWiseMinMaxScaler:
             X_orig[group_cols] = group_std.mul(row_range, axis=0).add(row_min, axis=0)
             
         return X_orig
+
+
+
+
 
