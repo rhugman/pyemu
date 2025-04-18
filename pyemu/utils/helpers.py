@@ -4430,12 +4430,17 @@ def dsivc_forward_run(md_ies="."):
     import pandas as pd
     import pyemu
     import os
-    import socket
     import pickle
+    from pyemu.utils.os_utils import PortManager
+
+    # load the dsi pest control file
+    pst_dsi = pyemu.Pst(os.path.join(md_ies,"dsi.pst"))
+    noptmax = pst_dsi.control_data.noptmax
+
     try:
-        os.remove("dsi.noise.csv")
+        os.remove("dsi.noise.jcb")
     except:
-        print("dsi.noise.csv not found, continuing...")
+        print("dsi.noise.jcb not found, continuing...")
     try:
         os.remove("dsi.stack.csv")
     except:
@@ -4445,35 +4450,15 @@ def dsivc_forward_run(md_ies="."):
     except:
         print("dsi.stack_stats.csv not found, continuing...")
     try:
-        os.remove("dsi.3.obs.csv")
+        os.remove(f"dsi.{noptmax}.obs.jcb")
     except:
-        print("dsi.3.obs.csv not found, continuing...")
-
-
-    def is_port_free(port, host='127.0.0.1'):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.1)
-            try:
-                s.bind((host, port))
-                return True
-            except OSError:
-                return False
-
-    def find_free_ports(n, start_port=4005, end_port=60000, host='127.0.0.1'):
-        free_ports = []
-        for port in range(start_port, end_port):
-            if is_port_free(port, host):
-                free_ports.append(port)
-                if len(free_ports) == n:
-                    break
-        return free_ports
+        print(f"dsi.{noptmax}.obs.jcb not found, continuing...")
 
     # load decvars
     decvars = pd.read_csv(os.path.join(md_ies, "dsivc_pars.csv"),index_col=0)
     assert decvars.shape[0]>0, "no decvars found in dsivc_pars.csv"
 
-    # load the dsi pest control file
-    pst_dsi = pyemu.Pst(os.path.join(md_ies,"dsi.pst"))
+
 
     # update the decavar obs values in the observation data
     obs = pst_dsi.observation_data
@@ -4482,19 +4467,19 @@ def dsivc_forward_run(md_ies="."):
     obs.loc[decvars.index,"obsval"] = decvars.values
 
     # update the obs+noise file with the decvar values to ensure NO NOISE on the decvars
-    noise = pyemu.ObservationEnsemble.from_csv(pst_dsi,os.path.join(md_ies,"dsi.obs+noise.csv"))._df
+    noise = pyemu.ObservationEnsemble.from_binary(pst_dsi,os.path.join(md_ies,"dsi.obs+noise.jcb"))
     # check that all of decvars.index are in noise.columns
     assert len([i for i in decvars.index if i not in noise.columns.tolist()]) == 0, "some decvars not in noise columns"
     # update columns in noise if column name in decvars.index
     for col in decvars.index:
-        noise[col] = noise[col].astype(float)
+        noise.loc[:,col] = noise.loc[:,col].astype(float)
         noise.loc[:,col] = decvars.loc[col].values[0]
     # record noise 
-    noise.to_csv(os.path.join(md_ies,"dsi.noise.csv"))
+    noise.to_binary(os.path.join(md_ies,"dsi.noise.jcb"))
     # make sure pestpp options 
-    pst_dsi.pestpp_options["ies_observation_ensemble"] = "dsi.noise.csv"
+    pst_dsi.pestpp_options["ies_observation_ensemble"] = "dsi.noise.jcb"
     # rewrite the dsi.pst file 
-    pst_dsi.write(os.path.join(md_ies,"dsi.pst"))
+    pst_dsi.write(os.path.join(md_ies,"dsi.pst"),version=2)
 
     # deploy dsi...
     pvals = pd.read_csv(os.path.join(md_ies,"dsi_pars.csv"),index_col=0)
@@ -4504,33 +4489,32 @@ def dsivc_forward_run(md_ies="."):
     pyemu.os_utils.start_workers(md_ies,"pestpp-ies","dsi.pst",
                                 num_workers=num_workers,
                                 worker_root=worker_root,
-                                port = find_free_ports(1)[0],
+                                port = PortManager().get_available_port(),
                                     master_dir=md_ies,
                                     reuse_master =True,
                                     ppw_function=pyemu.helpers.dsi_pyworker,
                                     ppw_kwargs={"dsi":dsi,"pvals":pvals})    
-    assert os.path.exists(os.path.join(md_ies,"dsi.3.obs.csv")), "dsi.3.obs.csv not found...pst failed?"
+    assert os.path.exists(os.path.join(md_ies,f"dsi.{noptmax}.obs.jcb")), f"dsi.{noptmax}.obs.jcb not found...pst failed?"
 
 
     #TODO: checks on PDC or Eulerian distance to training data?
 
-
     #postprocess stack
-    oe = pyemu.ObservationEnsemble.from_csv(pst_dsi,os.path.join(md_ies,"dsi.3.obs.csv"))
+    oe = pyemu.ObservationEnsemble.from_binary(pst_dsi,os.path.join(md_ies,f"dsi.{noptmax}.obs.jcb"))
     assert oe.shape[0] == noise.shape[0], "stack and noise shapes do not match; failed runs?"
-    # write long form oe
-    stack = oe._df.reset_index().melt(id_vars="real_name")
-    stack.rename(columns={"value":"obsval"},inplace=True)
-    stack['obsnme'] = stack.apply(lambda x: x.variable+"_real:"+x.real_name,axis=1)
-    stack.set_index("obsnme",inplace=True)
-    stack = stack.obsval
-    out_file = os.path.join(md_ies,"dsi.stack.csv")
-    stack.to_csv(out_file,float_format="%.6e")
+    if dsi.dsivc_arg.get("track_stack",False):
+        # write long form oe
+        stack = oe._df.reset_index().melt(id_vars="real_name")
+        stack.rename(columns={"value":"obsval"},inplace=True)
+        stack['obsnme'] = stack.apply(lambda x: x.variable+"_real:"+x.real_name,axis=1)
+        stack.set_index("obsnme",inplace=True)
+        stack = stack.obsval
+        out_file = os.path.join(md_ies,"dsi.stack.csv")
+        stack.to_csv(out_file,float_format="%.6e")
     #write stats
-
-    #TODO: add user-specified quantiles
-    
-    stack_stats = oe._df.describe(percentiles=[0.25,0.75,0.5]).reset_index().melt(id_vars="index")
+    #get user-specified quantiles
+    percentiles = self.dsivc_args.get("percentiles",[0.25,0.75,0.5])
+    stack_stats = oe._df.describe(percentiles=percentiles).reset_index().melt(id_vars="index")
     stack_stats.rename(columns={"value":"obsval","index":"stat"},inplace=True)
     stack_stats['obsnme'] = stack_stats.apply(lambda x: x.variable+"_stat:"+x.stat,axis=1)
     stack_stats.set_index("obsnme",inplace=True)
@@ -4751,3 +4735,27 @@ def inverse_normal_score_transform(nstval, val, value, extrap='quadratic'):
     
     return value, ilim
 
+def series_to_insfile(out_file,ins_file=None):
+    """
+    convert a Pandas Series to an ins file
+    Parameters
+    ----------
+    out_file : str
+        name of the output file to convert to ins file
+    ins_file : str
+        name of the ins file to create. if None, then out_file+".ins" is used
+    Returns
+    -------
+    None
+    """
+    if ins_file is None:
+        ins_file = out_file+".ins"
+    sdf = pd.read_csv(out_file,index_col=0)
+    assert sdf.shape[1] == 1, "only one column allowed"
+    sdf = sdf.iloc[:,0]
+    with open(ins_file,'w') as f:
+        f.write("pif ~\n")
+        f.write("l1\n")
+        for oname in sdf.index.values:
+            f.write("l1 ~,~ !{0}!\n".format(oname))
+    return
