@@ -39,6 +39,12 @@ optional = [
     "jinja2",  # for to_latex options
     "pypestutils"
 ]
+emulators = [
+    "scikit-learn",
+    "tensorflow",
+    "matplotlib",
+    "scipy",
+]
 test = [
     "coveralls",
     "pytest",
