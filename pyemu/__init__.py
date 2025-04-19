@@ -17,6 +17,9 @@ from .mat import Cov, Jco, Matrix
 from .plot import plot_utils
 from .pst import Pst, pst_utils, Results
 from .sc import Schur
+from .emulators import (Emulator, DSI, LDFA, BaseTransformer, Log10Transformer,
+                      RowWiseMinMaxScaler, StandardScalerTransformer, NormalScoreTransformer,
+                      TransformerPipeline, AutobotsAssemble)
 from .utils import (geostats, gw_utils, helpers, metrics, optimization,
                     os_utils, pp_utils, smp_utils)
 
@@ -52,5 +55,15 @@ __all__ = [
     "smp_utils",
     "plot_utils",
     "metrics",
+    "Emulator",
+    "DSI",
+    "LDFA",
+    "BaseTransformer",
+    "Log10Transformer", 
+    "RowWiseMinMaxScaler",
+    "StandardScalerTransformer",
+    "NormalScoreTransformer",
+    "TransformerPipeline",
+    "AutobotsAssemble",
 ]
 # del get_versions
