@@ -45,6 +45,7 @@ pyEMU also includes lots of functionality for dealing with PEST(++) datasets, su
 * full support for prior information equations in control files
 * preferred differencing prior information equations where the weights are based on the Pearson correlation coefficient
 * verification-based tests based on results from several PEST utilities
+* model emulation capabilities including Data Space Inversion (DSI) and Learning-based pattern-Data-driven Forecast Approach (LDFA)
 
 Version => 1.1 includes the `PstFrom` setup class to support generating PEST(++) interfaces in the 100,000 to 1,000,000 parameter range with all the bells and whistles.  A publication documenting the `PstFrom` class can be found here:
 
@@ -58,7 +59,7 @@ A publication documenting pyEMU and an example application can be found here:
 Funding
 =======
 
-pyEMU was originally developed with support from the U.S. Geological Survey. The New Zealand Strategic Science Investment Fund as part of GNS Science’s (https://www.gns.cri.nz/) Groundwater Research Programme has also funded contributions 2018-present.  Intera, Inc. has also provided funding for pyEMU development and support
+pyEMU was originally developed with support from the U.S. Geological Survey. The New Zealand Strategic Science Investment Fund as part of GNS Science's (https://www.gns.cri.nz/) Groundwater Research Programme has also funded contributions 2018-present.  Intera, Inc. has also provided funding for pyEMU development and support
 
 Examples
 ========
@@ -88,7 +89,28 @@ or
 
     >>>pip install pyemu
 
-pyEMU needs `numpy` and `pandas`.  For plotting, `matplotloib`, `pyshp`, and `flopy` to take advantage of the auto interface construction
+pyEMU needs `numpy` and `pandas` as its core dependencies.
+
+### Optional Dependencies
+
+PyEMU provides several optional dependency groups that you can install based on your needs:
+
+**Standard optional dependencies** (plotting, geospatial features):
+```
+pip install pyemu[optional]
+```
+This installs: `matplotlib`, `pyshp`, `scipy`, `shapely`, `flopy`, `jinja2`, and `pypestutils`
+
+**Emulators** (for model emulation capabilities):
+```
+pip install pyemu[emulators]
+```
+This installs: `scikit-learn`, `tensorflow`, `matplotlib`, and `scipy`
+
+**All dependencies** (for development or comprehensive usage):
+```
+pip install pyemu[optional,emulators]
+```
 
 After pyEMU is installed, the PEST++ software suite can be installed for your operating system  using the command:
 
