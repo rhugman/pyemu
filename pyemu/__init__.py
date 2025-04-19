@@ -6,7 +6,6 @@ Several forms of uncertainty analyses are support including FOSM-based
 analyses (pyemu.Schur and pyemu.ErrVar), data worth analyses and
 high-dimensional ensemble generation.
 """
-from .emulators import Emulator
 from .eds import EnDS
 from .en import Ensemble, ObservationEnsemble, ParameterEnsemble
 from .ev import ErrVar
