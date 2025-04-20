@@ -12,6 +12,7 @@ dependencies:
   - matplotlib
   - pyshp
   - jinja2
+  - scipy
   # tests
   - coveralls
   - flaky
