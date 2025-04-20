@@ -1,6 +1,7 @@
 name: pyemu
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
   # required
   - python>=3.8
@@ -10,6 +11,8 @@ dependencies:
   - matplotlib
   - pyshp
   - jinja2
+  - tensorflow
+  - scikit-learn
   # tests
   - coveralls
   - flaky
