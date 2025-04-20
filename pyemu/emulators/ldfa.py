@@ -4,14 +4,86 @@ Learning-based pattern-data-driven forecast approach (LDFA) emulator implementat
 from __future__ import print_function, division
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.callbacks import EarlyStopping
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA
 
 from .base import Emulator
 from .transformers import RowWiseMinMaxScaler
+
+# Define PyTorch model class
+class LDFAModel(nn.Module):
+    """
+    PyTorch implementation of the LDFA neural network model.
+    """
+    def __init__(self, input_dim, output_dim, hidden_units=None, activation='relu', dropout_rate=0.0):
+        super().__init__()
+        
+        if hidden_units is None:
+            hidden_units = [2 * input_dim]
+            
+        layers = []
+        prev_dim = input_dim
+        
+        # Create hidden layers
+        for units in hidden_units:
+            layers.append(nn.Linear(prev_dim, units))
+            
+            # Apply activation function
+            if activation == 'relu':
+                layers.append(nn.ReLU())
+            elif activation == 'tanh':
+                layers.append(nn.Tanh())
+            elif activation == 'sigmoid':
+                layers.append(nn.Sigmoid())
+            else:
+                layers.append(nn.ReLU())  # Default to ReLU
+                
+            # Apply dropout if specified
+            if dropout_rate > 0:
+                layers.append(nn.Dropout(dropout_rate))
+                
+            prev_dim = units
+            
+        # Output layer
+        layers.append(nn.Linear(prev_dim, output_dim))
+        
+        # Create sequential model
+        self.model = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        """Forward pass through the network"""
+        return self.model(x)
+
+# Early stopping handler
+class EarlyStopping:
+    """
+    Early stopping to terminate training when validation loss doesn't improve.
+    """
+    def __init__(self, patience=20, min_delta=0, restore_best_weights=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+        self.best_model = None
+        
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.restore_best_weights:
+                self.best_model = {key: val.cpu().clone() for key, val in model.state_dict().items()}
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.restore_best_weights and self.best_model is not None:
+                    model.load_state_dict(self.best_model)
 
 class LDFA(Emulator):
     """
@@ -99,7 +171,6 @@ class LDFA(Emulator):
         self.early_stop = None
         if early_stop:
             self.early_stop = EarlyStopping(
-                monitor='val_loss', 
                 patience=20, 
                 restore_best_weights=True
             )
@@ -168,11 +239,7 @@ class LDFA(Emulator):
         # Apply row-wise min-max scaling
         self.logger.statement("applying row-wise min-max scaling")
         # Store the row-wise min-max scaler for use in prediction
-        self.rowwise_mm_scaler = RowWiseMinMaxScaler(
-            feature_range=(-1, 1),
-            groups=self.groups,
-            fit_groups=self.fit_groups
-        )
+
         
         # Apply transformations using the base class method
         if transforms:
@@ -183,9 +250,24 @@ class LDFA(Emulator):
             test_transformed = test
         
         # Apply row-wise min-max scaling directly (not through the pipeline)
-        self.rowwise_mm_scaler.fit(train_transformed)
-        train_scaled = self.rowwise_mm_scaler.transform(train_transformed)
-        test_scaled = self.rowwise_mm_scaler.transform(test_transformed)
+        self.rowwise_mm_scalers ={
+            "train": RowWiseMinMaxScaler(
+                        feature_range=(-1, 1),
+                        groups=self.groups,
+                        fit_groups=self.fit_groups )
+        }
+        
+        self.rowwise_mm_scalers["train"].fit(train_transformed)
+        train_scaled = self.rowwise_mm_scalers["train"].transform(train_transformed)
+
+
+        self.rowwise_mm_scalers["test"] =  RowWiseMinMaxScaler(
+                        feature_range=(-1, 1),
+                        groups=self.groups,
+                        fit_groups=self.fit_groups )
+        self.rowwise_mm_scalers["train"].fit(test_transformed)
+        test_scaled = self.rowwise_mm_scalers["test"].transform(test_transformed)
+
         
         self.logger.statement("row-wise min-max scaling complete")
         
@@ -198,9 +280,9 @@ class LDFA(Emulator):
         
         # Apply PCA to reduce the dimensionality of the data
         self.logger.statement("applying PCA dimensionality reduction")
-        self.pcaX = PCA(n_components=self.energy_threshold)
-        self.pcay = PCA(n_components=self.energy_threshold)
-        
+        self.pcaX = PCA()#n_components=X_test.shape[1])
+        self.pcay = PCA()#n_components=y_test.shape[1])
+
         self.X = self.pcaX.fit_transform(X_train)
         self.y = self.pcay.fit_transform(y_train)
         
@@ -234,8 +316,8 @@ class LDFA(Emulator):
             
         Returns
         -------
-        tensorflow.keras.Model
-            The compiled Keras model.
+        LDFAModel
+            The PyTorch model instance.
         """
         if params is None:
             params = {
@@ -255,34 +337,13 @@ class LDFA(Emulator):
         input_dim = self.X.shape[1]
         output_dim = self.y.shape[1]
         
-        # Set seed for reproducibility
-        if self.seed is not None:
-            tf.keras.utils.set_random_seed(self.seed)
-            
         # Create the model architecture
-        inputs = tf.keras.Input(shape=(input_dim,))
-        x = inputs
-        
-        # Add hidden layers
-        if hidden_units is None:
-            hidden_units = [2 * input_dim]
-            
-        for units in hidden_units:
-            x = layers.Dense(units, activation=activation)(x)
-            x = layers.Dropout(rate=dropout_rate)(x)
-
-        # Output layer
-        outputs = layers.Dense(output_dim)(x)
-        
-        # Define loss function
-        loss_fn = 'mean_squared_error'
-        
-        # Create and compile the model
-        model = models.Model(inputs=inputs, outputs=outputs)
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=params['learning_rate']),
-            loss=loss_fn,
-            metrics=['mae', 'accuracy']
+        model = LDFAModel(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hidden_units=hidden_units,
+            activation=activation,
+            dropout_rate=dropout_rate
         )
         
         return model
@@ -318,28 +379,99 @@ class LDFA(Emulator):
         self : LDFA
             The emulator instance with noise model added.
         """
+        # Create the noise model with the same architecture as the main model
         self.noise_model = self._build_model(params)
-
+        
         # Get residuals from main model predictions
-        pred = self.model.predict(self.X)
-        res = self.y - pred
-
-        # Get test residuals
-        pred_test = self.model.predict(self.X_test)
-        res_test = self.y_test - pred_test
+        with torch.no_grad():
+            # Convert input data to tensors
+            X_tensor = torch.tensor(self.X, dtype=torch.float32)
+            y_tensor = torch.tensor(self.y, dtype=torch.float32)
+            
+            # Get predictions from main model
+            self.model.eval()
+            pred_tensor = self.model(X_tensor)
+            
+            # Calculate residuals
+            res_tensor = y_tensor - pred_tensor
+            
+            # Get test residuals
+            X_test_tensor = torch.tensor(self.X_test, dtype=torch.float32)
+            y_test_tensor = torch.tensor(self.y_test, dtype=torch.float32)
+            pred_test_tensor = self.model(X_test_tensor)
+            res_test_tensor = y_test_tensor - pred_test_tensor
 
         # Train the noise model on residuals
         self.logger.statement("training noise model on residuals")
-        history = self.noise_model.fit(
-            self.X, res, 
-            epochs=200, 
+        
+        # Create DataLoader for batch processing
+        train_dataset = TensorDataset(X_tensor, res_tensor)
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=32,
-            validation_data=(self.X_test, res_test),
-            callbacks=[self.early_stop] if self.early_stop else None,
-            verbose=1
+            shuffle=True
         )
         
-        self.noise_history = history
+        # Setup optimizer and loss function
+        optimizer = optim.Adam(self.noise_model.parameters(), lr=0.01)
+        criterion = nn.MSELoss()
+        
+        # Setup early stopping
+        early_stop = None
+        if self.early_stop:
+            early_stop = EarlyStopping(
+                patience=20, 
+                restore_best_weights=True
+            )
+        
+        # Set model to training mode
+        self.noise_model.train()
+        
+        # Training loop
+        for epoch in range(200):
+            epoch_loss = 0.0
+            
+            # Train on batches
+            for batch_X, batch_res in train_loader:
+                # Zero gradients
+                optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = self.noise_model(batch_X)
+                loss = criterion(outputs, batch_res)
+                
+                # Backward pass and optimization
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item() * len(batch_X)
+            
+            # Calculate average loss
+            epoch_loss /= len(X_tensor)
+            
+            # Validation
+            with torch.no_grad():
+                self.noise_model.eval()
+                val_outputs = self.noise_model(X_test_tensor)
+                val_loss = criterion(val_outputs, res_test_tensor).item()
+                self.noise_model.train()
+            
+            # Log progress
+            if  (epoch + 1) % 20 == 0:
+                self.logger.statement(
+                    f"Noise model - Epoch {epoch+1}/200 - loss: {epoch_loss:.6f} - val_loss: {val_loss:.6f}"
+                )
+            
+            # Early stopping check
+            if early_stop:
+                early_stop(val_loss, self.noise_model)
+                if early_stop.early_stop:
+                    self.logger.statement(f"Early stopping noise model at epoch {epoch+1}")
+                    break
+        
+        # Set noise model to evaluation mode for inference
+        self.noise_model.eval()
+        
         return self
 
     def fit(self, epochs=200, batch_size=32, X=None, y=None, prepare_data=True):
@@ -370,24 +502,82 @@ class LDFA(Emulator):
             
         if self.model is None:
             self.create_model()
-            
-        X_train = self.X if X is None else X
-        y_train = self.y
-        X_test = self.X_test
-        y_test = self.y_test
-
-        self.logger.statement(f"fitting model: {epochs} epochs, batch size {batch_size}")
-        history = self.model.fit(
-            X_train, y_train, 
-            epochs=epochs, 
+        
+        # Set model to training mode
+        self.model.train()
+        
+        # Convert numpy arrays to PyTorch tensors
+        X_train = torch.tensor(self.X if X is None else X, dtype=torch.float32)
+        y_train = torch.tensor(self.y, dtype=torch.float32)
+        X_test = torch.tensor(self.X_test, dtype=torch.float32)
+        y_test = torch.tensor(self.y_test, dtype=torch.float32)
+        
+        # Create DataLoader for batch processing
+        train_dataset = TensorDataset(X_train, y_train)
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=batch_size,
-            validation_data=(X_test, y_test),
-            callbacks=[self.early_stop] if self.early_stop else None,
-            verbose=1
+            shuffle=True
         )
         
-        self.history = history
+        # Create optimizer and loss function
+        self.logger.statement(f"fitting model: {epochs} epochs, batch size {batch_size}")
+        optimizer = optim.Adam(self.model.parameters(), lr=0.01)
+        criterion = nn.MSELoss()
+        
+        # Track training history (like Keras' History object)
+        history = {
+            'loss': [],
+            'val_loss': []
+        }
+        
+        # Training loop
+        for epoch in range(epochs):
+            # Training
+            epoch_loss = 0.0
+            for batch_X, batch_y in train_loader:
+                # Zero gradients
+                optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                
+                # Backward pass and optimization
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item() * len(batch_X)
+            
+            # Calculate average loss for the epoch
+            epoch_loss /= len(X_train)
+            history['loss'].append(epoch_loss)
+            
+            # Validation
+            with torch.no_grad():
+                self.model.eval()  # Set model to evaluation mode
+                val_outputs = self.model(X_test)
+                val_loss = criterion(val_outputs, y_test).item()
+                history['val_loss'].append(val_loss)
+                self.model.train()  # Set model back to training mode
+            
+            # Log progress
+            if  (epoch + 1) % 10 == 0:
+                self.logger.statement(
+                    f"Epoch {epoch+1}/{epochs} - loss: {epoch_loss:.6f} - val_loss: {val_loss:.6f}"
+                )
+            
+            # Early stopping check
+            if self.early_stop:
+                self.early_stop(val_loss, self.model)
+                if self.early_stop.early_stop:
+                    self.logger.statement(f"Early stopping at epoch {epoch+1}")
+                    break
+        
+        # Set model to evaluation mode for inference
+        self.model.eval()
         self.fitted = True
+        self.history = history
         return self
 
     def predict(self, data):
@@ -411,6 +601,11 @@ class LDFA(Emulator):
             raise ValueError("No model has been created. Call create_model() first")
             
         self.logger.statement("generating predictions from fitted model")
+        
+        # Set model to evaluation mode
+        self.model.eval()
+        if self.noise_model is not None:
+            self.noise_model.eval()
             
         # Make a copy of the input data to avoid modifying the original
         truth = data.copy()
@@ -442,17 +637,25 @@ class LDFA(Emulator):
         y_truth = truth_scaled.loc[:, self.forecast_names].copy()
         
         # Apply PCA transform
-        truth_pca = self.pcaX.transform(X_truth.values.reshape(1, -1))
+        truth_pca = self.pcaX.transform(X_truth.values)
         
-        # STEP 2: Run model prediction
+        # STEP 2: Run model prediction with torch.no_grad() for efficient inference
         self.logger.statement("running model prediction")
-        pred_pca = self.model.predict(truth_pca)
-        
-        # Add noise prediction if available
-        if self.noise_model is not None:
-            self.logger.statement("adding noise model prediction")
-            noise = self.noise_model.predict(truth_pca)
-            pred_pca = pred_pca + noise
+        with torch.no_grad():
+            # Convert numpy array to PyTorch tensor
+            truth_tensor = torch.tensor(truth_pca, dtype=torch.float32)
+            
+            # Get model prediction
+            pred_tensor = self.model(truth_tensor)
+            
+            # Add noise prediction if available
+            if self.noise_model is not None:
+                self.logger.statement("adding noise model prediction")
+                noise_tensor = self.noise_model(truth_tensor)
+                pred_tensor = pred_tensor + noise_tensor
+                
+            # Convert PyTorch tensor back to numpy array
+            pred_pca = pred_tensor.cpu().numpy()
         
         # STEP 3: Apply inverse transformations in REVERSE order of the original transformations
         self.logger.statement("performing inverse transformations")
