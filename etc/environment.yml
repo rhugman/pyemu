@@ -11,8 +11,6 @@ dependencies:
   - matplotlib
   - pyshp
   - jinja2
-  - tensorflow
-  - scikit-learn
   # tests
   - coveralls
   - flaky
@@ -27,3 +25,5 @@ dependencies:
   - scikit-learn
   - pip
   - ffmpeg
+  - pip:
+      - tensorflow
