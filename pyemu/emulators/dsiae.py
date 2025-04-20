@@ -6,11 +6,450 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import os
 import datetime
+import copy
 
 from .base import Emulator
+
+class Encoder(nn.Module):
+    """
+    Encoder component of the DSIAE Variational Autoencoder.
+    
+    This module encodes data from different modalities (scalar, time series, spatial)
+    into a latent space representation.
+    
+    Parameters
+    ----------
+    input_shapes : dict
+        Dictionary containing the shapes of different input types:
+        {
+            'scalar': (num_scalar_features,),
+            'timeseries': [(ts1_seq_len, ts1_features), (ts2_seq_len, ts2_features), ...],
+            'spatial': [(spatial1_height, spatial1_width, spatial1_channels), ...]
+        }
+    latent_dim : int
+        Dimension of the latent space.
+    """
+    def __init__(self, input_shapes, latent_dim=8):
+        super().__init__()
+        
+        self.input_shapes = input_shapes
+        self.latent_dim = latent_dim
+        
+        # Branch processing networks
+        self.scalar_net = None
+        self.timeseries_nets = nn.ModuleList() if 'timeseries' in input_shapes else None
+        self.spatial_nets = nn.ModuleList() if 'spatial' in input_shapes else None
+        
+        # Dimensions for each branch output
+        self.scalar_dim = 0
+        self.timeseries_dim = 0
+        self.spatial_dim = 0
+        
+        # Build the scalar branch
+        if 'scalar' in input_shapes and input_shapes['scalar'][0] > 0:
+            scalar_input_dim = input_shapes['scalar'][0]
+            self.scalar_dim = max(32, min(128, scalar_input_dim * 2))
+            
+            self.scalar_net = nn.Sequential(
+                nn.Linear(scalar_input_dim, 64),
+                nn.LeakyReLU(0.2),
+                nn.Linear(64, self.scalar_dim),
+                nn.LeakyReLU(0.2),
+            )
+        
+        # Build time series branches if needed
+        if 'timeseries' in input_shapes and input_shapes['timeseries']:
+            for i, shape in enumerate(input_shapes['timeseries']):
+                seq_len, features = shape
+                
+                # For short sequences, use simple networks
+                if seq_len <= 10:
+                    ts_net = nn.Sequential(
+                        nn.Linear(seq_len * features, 64),
+                        nn.LeakyReLU(0.2),
+                        nn.Linear(64, 32),
+                        nn.LeakyReLU(0.2)
+                    )
+                # For longer sequences, use 1D CNNs
+                else:
+                    ts_net = nn.Sequential(
+                        nn.Conv1d(features, 32, kernel_size=3, stride=1, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.MaxPool1d(2),
+                        nn.Conv1d(32, 64, kernel_size=3, stride=1, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.MaxPool1d(2),
+                        nn.Flatten(),
+                        nn.Linear(64 * (seq_len // 4), 32),
+                        nn.LeakyReLU(0.2)
+                    )
+                    
+                self.timeseries_nets.append(ts_net)
+                self.timeseries_dim += 32  # Add output dimension for each TS branch
+        
+        # Build spatial branches if needed
+        if 'spatial' in input_shapes and input_shapes['spatial']:
+            for i, shape in enumerate(input_shapes['spatial']):
+                h, w, c = shape
+                
+                # For small images/grids, use simpler networks
+                if h * w <= 100:  # e.g., 10x10 or smaller
+                    spatial_net = nn.Sequential(
+                        nn.Flatten(),
+                        nn.Linear(h * w * c, 64),
+                        nn.LeakyReLU(0.2),
+                        nn.Linear(64, 32),
+                        nn.LeakyReLU(0.2)
+                    )
+                # For larger spatial data, use CNNs
+                else:
+                    spatial_net = nn.Sequential(
+                        nn.Conv2d(c, 16, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.MaxPool2d(2),
+                        nn.Conv2d(16, 32, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.MaxPool2d(2),
+                        nn.Flatten(),
+                        nn.Linear(32 * (h // 4) * (w // 4), 32),
+                        nn.LeakyReLU(0.2)
+                    )
+                    
+                self.spatial_nets.append(spatial_net)
+                self.spatial_dim += 32  # Add output dimension for each spatial branch
+        
+        # Calculate total feature dimension after all branches
+        self.total_features = self.scalar_dim + self.timeseries_dim + self.spatial_dim
+        
+        # Feature fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(self.total_features, 64),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # VAE bottleneck outputs
+        self.z_mean = nn.Linear(64, latent_dim)
+        self.z_log_var = nn.Linear(64, latent_dim)
+        
+    def reparameterize(self, z_mean, z_log_var):
+        """
+        Reparameterization trick to sample from N(z_mean, z_var) while allowing backprop.
+        
+        Parameters
+        ----------
+        z_mean : torch.Tensor
+            Mean of the latent Gaussian.
+        z_log_var : torch.Tensor
+            Log variance of the latent Gaussian.
+            
+        Returns
+        -------
+
+        torch.Tensor
+            Sampled latent vector.
+        """
+        std = torch.exp(0.5 * z_log_var)
+        eps = torch.randn_like(std)
+        z = z_mean + eps * std
+        return z
+    
+    def forward(self, inputs):
+        """
+        Forward pass through the encoder.
+        
+        Parameters
+        ----------
+
+        inputs : list of torch.Tensor
+            List of input tensors for each data modality.
+            
+        Returns
+        -------
+
+        tuple
+            (z_mean, z_log_var, z) - latent space representations:
+            z_mean: mean values of the latent space
+            z_log_var: log variance values of the latent space
+            z: sampled latent vectors
+        """
+        features = []
+        input_idx = 0
+        
+        # Process scalar inputs
+        if self.scalar_net is not None:
+            scalar_features = self.scalar_net(inputs[input_idx])
+            features.append(scalar_features)
+            input_idx += 1
+        
+        # Process time series inputs
+        if self.timeseries_nets is not None:
+            for i, ts_net in enumerate(self.timeseries_nets):
+                ts_input = inputs[input_idx]
+                # Reshape if using 1D CNNs
+                if isinstance(ts_net[0], nn.Conv1d):
+                    # Input shape should be [batch, features, seq_len]
+                    if ts_input.shape[2] == 1:  # Check if shape is [batch, seq_len, features=1]
+                        # For single-feature time series, transpose to [batch, features, seq_len]
+                        ts_input = ts_input.transpose(1, 2)
+                ts_features = ts_net(ts_input)
+                features.append(ts_features)
+                input_idx += 1
+        
+        # Process spatial inputs
+        if self.spatial_nets is not None:
+            for i, spatial_net in enumerate(self.spatial_nets):
+                spatial_input = inputs[input_idx]
+                # Reshape if using 2D CNNs
+                if isinstance(spatial_net[0], nn.Conv2d):
+                    # Input shape should be [batch, channels, height, width]
+                    spatial_input = spatial_input.permute(0, 3, 1, 2)
+                spatial_features = spatial_net(spatial_input)
+                features.append(spatial_features)
+                input_idx += 1
+        
+        # Concatenate all features
+        x = torch.cat(features, dim=1)
+        
+        # Apply fusion layer
+        x = self.fusion(x)
+        
+        # VAE outputs
+        z_mean = self.z_mean(x)
+        z_log_var = self.z_log_var(x)
+        z = self.reparameterize(z_mean, z_log_var)
+        
+        return z_mean, z_log_var, z
+
+
+class Decoder(nn.Module):
+    """
+    Decoder component of the DSIAE Variational Autoencoder.
+    
+    This module decodes latent space representations back to the original data spaces,
+    including scalar, time series, and spatial data.
+    
+    Parameters
+    ----------
+
+    latent_dim : int
+        Dimension of the latent space.
+    output_shapes : dict
+        Dictionary containing the shapes of different output types:
+        {
+            'scalar': (num_scalar_features,),
+            'timeseries': [(ts1_seq_len, ts1_features), (ts2_seq_len, ts2_features), ...],
+            'spatial': [(spatial1_height, spatial1_width, spatial1_channels), ...]
+        }
+    """
+    def __init__(self, latent_dim, output_shapes):
+        super().__init__()
+        
+        self.latent_dim = latent_dim
+        self.output_shapes = output_shapes
+        
+        # Latent to hidden expansion
+        self.latent_expansion = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # Branch processors
+        self.scalar_net = None
+        self.timeseries_nets = nn.ModuleList() if 'timeseries' in output_shapes else None
+        self.spatial_nets = nn.ModuleList() if 'spatial' in output_shapes else None
+        
+        # Create output branches
+        
+        # Scalar branch
+        if 'scalar' in output_shapes and output_shapes['scalar'][0] > 0:
+            scalar_output_dim = output_shapes['scalar'][0]
+            self.scalar_net = nn.Sequential(
+                nn.Linear(64, 64),
+                nn.LeakyReLU(0.2),
+                nn.Linear(64, scalar_output_dim)
+            )
+        
+        # Time series branches
+        if 'timeseries' in output_shapes and output_shapes['timeseries']:
+            for i, shape in enumerate(output_shapes['timeseries']):
+                seq_len, features = shape
+                
+                # For short sequences, use simple networks
+                if seq_len <= 10:
+                    ts_net = nn.Sequential(
+                        nn.Linear(64, 64),
+                        nn.LeakyReLU(0.2),
+                        nn.Linear(64, seq_len * features)
+                    )
+                # For longer sequences, use transposed convolutions
+                else:
+                    # Calculate intermediate dimensions
+                    first_layer_size = seq_len // 4
+                    
+                    ts_net = nn.Sequential(
+                        nn.Linear(64, 64 * first_layer_size),
+                        nn.LeakyReLU(0.2),
+                        nn.Unflatten(1, (64, first_layer_size)),
+                        nn.Upsample(scale_factor=2),
+                        nn.Conv1d(64, 32, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.Upsample(scale_factor=2),
+                        nn.Conv1d(32, features, kernel_size=3, padding=1)
+                    )
+                    
+                self.timeseries_nets.append(ts_net)
+                
+        # Spatial branches
+        if 'spatial' in output_shapes and output_shapes['spatial']:
+            for i, shape in enumerate(output_shapes['spatial']):
+                h, w, c = shape
+                
+                # For small images/grids, use simpler networks
+                if h * w <= 100:  # e.g., 10x10 or smaller
+                    spatial_net = nn.Sequential(
+                        nn.Linear(64, 64),
+                        nn.LeakyReLU(0.2),
+                        nn.Linear(64, h * w * c)
+                    )
+                # For larger spatial data, use transposed convolutions
+                else:
+                    # Calculate intermediate dimensions
+                    h_small = h // 4
+                    w_small = w // 4
+                    
+                    spatial_net = nn.Sequential(
+                        nn.Linear(64, 32 * h_small * w_small),
+                        nn.LeakyReLU(0.2),
+                        nn.Unflatten(1, (32, h_small, w_small)),
+                        nn.Upsample(scale_factor=2),
+                        nn.Conv2d(32, 16, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.Upsample(scale_factor=2),
+                        nn.Conv2d(16, c, kernel_size=3, padding=1)
+                    )
+                    
+                self.spatial_nets.append(spatial_net)
+                
+    def forward(self, z):
+        """
+        Forward pass through the decoder.
+        
+        Parameters
+        ----------
+
+        z : torch.Tensor
+            Latent space representation.
+            
+        Returns
+        -------
+
+        list
+            List of decoded outputs for each data type.
+        """
+        # Expand latent vector to hidden representation
+        x = self.latent_expansion(z)
+        
+        outputs = []
+        
+        # Decode scalar outputs if needed
+        if self.scalar_net is not None:
+            scalar_output = self.scalar_net(x)
+            outputs.append(scalar_output)
+        
+        # Decode time series outputs
+        if self.timeseries_nets is not None:
+            for i, ts_net in enumerate(self.timeseries_nets):
+                ts_output = ts_net(x)
+                
+                # For Conv1d-based decoders, output shape is [batch, features, seq_len]
+                seq_len, features = self.output_shapes['timeseries'][i]
+                
+                # Reshape output based on architecture
+                if len(ts_output.shape) == 3:  # [batch, features, seq_len] from Conv1d
+                    # Ensure output is properly shaped as [batch, seq_len, features]
+                    ts_output = ts_output.transpose(1, 2)
+                else:
+                    # For MLP-based networks, reshape from flattened form to [batch, seq_len, features]
+                    ts_output = ts_output.view(-1, seq_len, features)
+                    
+                outputs.append(ts_output)
+        
+        # Decode spatial outputs
+        if self.spatial_nets is not None:
+            for i, spatial_net in enumerate(self.spatial_nets):
+                spatial_output = spatial_net(x)
+                
+                # Reshape output if using transposed convolutions
+                if len(spatial_output.shape) == 4:  # [batch, channels, height, width]
+                    # Change to [batch, height, width, channels]
+                    spatial_output = spatial_output.permute(0, 2, 3, 1)
+                else:
+                    # Reshape to [batch, height, width, channels]
+                    h, w, c = self.output_shapes['spatial'][i]
+                    spatial_output = spatial_output.view(-1, h, w, c)
+                    
+                outputs.append(spatial_output)
+        
+        return outputs
+
+
+class VariationalAutoEncoder(nn.Module):
+    """
+    Variational Autoencoder for DSIAE.
+    
+    This combines the encoder and decoder components into a complete VAE model.
+    
+    Parameters
+    ----------
+
+    input_shapes : dict
+        Dictionary containing the shapes of different input types.
+    output_shapes : dict
+        Dictionary containing the shapes of different output types.
+    latent_dim : int
+        Dimension of the latent space. Default is 8.
+    """
+    def __init__(self, input_shapes, output_shapes, latent_dim=8):
+        super().__init__()
+        
+        self.encoder = Encoder(input_shapes, latent_dim)
+        self.decoder = Decoder(latent_dim, output_shapes)
+        
+    def forward(self, inputs):
+        """
+        Forward pass through the complete autoencoder.
+        
+        Parameters
+        ----------
+
+        inputs : list of torch.Tensor
+            List of input tensors for each data modality.
+            
+        Returns
+        -------
+
+        tuple
+            (outputs, z_mean, z_log_var, z) where:
+            outputs: list of decoded outputs for each data type
+            z_mean: mean values of the latent space
+            z_log_var: log variance values of the latent space
+            z: sampled latent vectors
+        """
+        # Encode inputs to latent space
+        z_mean, z_log_var, z = self.encoder(inputs)
+        
+        # Decode latent vectors to outputs
+        outputs = self.decoder(z)
+        
+        return outputs, z_mean, z_log_var, z
+
 
 class DSIAE(Emulator):
     """
@@ -24,8 +463,9 @@ class DSIAE(Emulator):
     ----------
     sim_obs : pandas.DataFrame
         Simulation observations data with columns as observation names and rows as realizations.
-    pars : pandas.DataFrame
+    pars : pandas.DataFrame, optional
         Parameters data with columns as parameter names and rows as realizations.
+        This is only needed for prediction, not for training the autoencoder.
     obs_names : list, optional
         List of observation names to include in the emulator. If None, all observations are used.
     par_names : list, optional
@@ -75,10 +515,20 @@ class DSIAE(Emulator):
         Learning rate for the optimizer. Default is 0.001.
     verbose : bool, optional
         If True, enable verbose logging. Default is True.
+    device : str, optional
+        Device to use for training. Default is 'auto', which will use GPU if available.
     """
 
-    def __init__(self, sim_obs=None, pars=None, obs_names=None, par_names=None, 
-                 data_type_map=None, latent_dim=8, learning_rate=0.001, verbose=True):
+    def __init__(self, 
+                sim_obs=None, 
+                pars=None, 
+                obs_names=None, 
+                par_names=None, 
+                data_type_map=None, 
+                latent_dim=8, 
+                learning_rate=0.001, 
+                verbose=True,
+                device='auto'):
         """
         Initialize the DSIAE emulator.
 
@@ -86,63 +536,29 @@ class DSIAE(Emulator):
         ----------
         sim_obs : pandas.DataFrame
             Simulation observations data with columns as observation names and rows as realizations.
-        pars : pandas.DataFrame
+        pars : pandas.DataFrame, optional
             Parameters data with columns as parameter names and rows as realizations.
+            This is only needed for prediction, not for training the autoencoder.
         obs_names : list, optional
             List of observation names to include in the emulator. If None, all observations are used.
         par_names : list, optional
             List of parameter names to include in the emulator. If None, all parameters are used.
         data_type_map : dict, optional
-            Dictionary specifying how to organize observation columns by data type. Must have the structure:
-            {
-                'scalar': [column names],  # All scalar columns
-                'timeseries': {
-                    'group1': {
-                        'columns': [column names],  # Ordered list of column names
-                        'coordinates': [t1, t2, ...],  # Corresponding time coordinates 
-                        'frequency': '1D',  # Optional for uniform time steps
-                        'irregular': False  # Optional flag for irregular time series
-                    },
-                    'group2': {
-                        'columns': [...],
-                        'coordinates': [...],
-                        ...
-                    },
-                    ...
-                },
-                'spatial': {
-                    'group1': {
-                        'columns': [column names],  # Ordered list of column names
-                        'coordinates': [(x1,y1,z1), (x2,y2,z2), ...],  # Corresponding spatial coordinates
-                        'dimensions': (nx, ny, nz),  # Optional grid dimensions
-                        'spacing': (dx, dy, dz)  # Optional grid spacing
-                    },
-                    'group2': {
-                        'columns': [...],
-                        'coordinates': [...],
-                        ...
-                    },
-                    ...
-                }
-            }
-            
-            For both timeseries and spatial data, the coordinates list must be the same length as the columns list.
-            Time series coordinates can be numeric values representing time steps or points.
-            Spatial coordinates should be tuples of 2D (x,y) or 3D (x,y,z) coordinates.
-            
-            If None, all observations are treated as scalars.
+            Dictionary specifying how to organize observation columns by data type.
         latent_dim : int, optional
             Dimension of the latent space. Default is 8.
         learning_rate : float, optional
             Learning rate for the optimizer. Default is 0.001.
         verbose : bool, optional
             If True, enable verbose logging. Default is True.
+        device : str, optional
+            Device to use for training. Default is 'auto', which will use GPU if available.
         """
         super().__init__(verbose=verbose)
         
         # Store input data
         self.sim_obs = sim_obs
-        self.pars = pars
+        self.pars = pars  # Optional - only needed for prediction, not for model training
         
         # Set observation and parameter names
         if obs_names is None and sim_obs is not None:
@@ -155,623 +571,914 @@ class DSIAE(Emulator):
         
         # Data organization
         self.data_type_map = data_type_map or {}  # Default to empty dict if None
+        self.organized_obs = None
         
         # Model parameters
         self.latent_dim = latent_dim
         self.learning_rate = learning_rate
         
+        # Select device (CPU or GPU)
+        if device == 'auto':
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+        
+        self.logger.statement(f"Using device: {self.device}")
+        
         # State variables
         self.encoder = None
         self.decoder = None
-        self.autoencoder = None
+        self.vae = None
         self.obs_vec = None  # Mean of observations
-        self.par_vec = None  # Mean of parameters
-        self.kdtree = None
-        self.min_max = {}
+        self.par_vec = None  # Mean of parameters (only used if parameters provided)
+        self.sim_vals = None  # Transformed training data
+        self.kdtree = None   # KDTree for parameter space (created only when needed for prediction)
+        self.min_max = {}    # Parameter bounds (created only when needed for prediction)
         self.weights = None
         self.use_localizer = False
         self.fitted = False
         
-    def _organize_data_types(self, data):
-        """
-        Organize data into different types based on data_type_map.
-        
-        The data_type_map must be provided in the following structure:
-        {
-            'scalar': [column names],  # All scalar columns
-            'timeseries': {
-                'group1': {
-                    'columns': [column names],  # Ordered list of column names
-                    'coordinates': [t1, t2, ...],  # Corresponding time coordinates 
-                    'frequency': '1D',  # Optional for uniform time steps
-                    'irregular': False  # Optional flag for irregular time series
-                },
-                'group2': {...},
-                ...
-            },
-            'spatial': {
-                'group1': {
-                    'columns': [column names],  # Ordered list of column names
-                    'coordinates': [(x1,y1,z1), (x2,y2,z2), ...],  # Corresponding spatial coordinates
-                    'dimensions': (nx, ny, nz),  # Optional grid dimensions
-                    'spacing': (dx, dy, dz)  # Optional grid spacing
-                },
-                'group2': {...},
-                ...
-            }
+        # Training history
+        self.training_history = {
+            'total_loss': [],
+            'reconstruction_loss': [],
+            'kl_loss': [],
+            'val_total_loss': [],
+            'val_reconstruction_loss': [],
+            'val_kl_loss': []
         }
         
-        For both timeseries and spatial data, the coordinates list must be the same length as the columns list.
-        Time series coordinates can be numeric values representing time steps or points.
-        Spatial coordinates should be tuples of 2D (x,y) or 3D (x,y,z) coordinates.
+        # If observation data is provided at initialization, prepare it
+        if sim_obs is not None:
+            self.prepare_data(sim_obs, pars, obs_names, par_names)
+        
+    def prepare_data(self, sim_obs, pars=None, obs_names=None, par_names=None):
+        """
+        Prepare data for training the DSIAE emulator.
         
         Parameters
         ----------
-        data : pandas.DataFrame
-            Data to organize.
+        sim_obs : pandas.DataFrame
+            Simulation observations data with columns as observation names and rows as realizations.
+        pars : pandas.DataFrame, optional
+            Parameters data with columns as parameter names and rows as realizations.
+            This is only needed for prediction, not for training the autoencoder.
+        obs_names : list, optional
+            List of observation names to include in the emulator.
+        par_names : list, optional
+            List of parameter names to include in the emulator.
             
+        Returns
+        -------
+        None
+        """
+        # Store original data
+        self.sim_obs = sim_obs
+        self.pars = pars  # May be None if only training
+        
+        # Update observation names if provided
+        if obs_names is not None:
+            self.obs_names = obs_names
+        elif self.obs_names is None:
+            self.obs_names = sim_obs.columns.tolist()
+            
+        # Update parameter names if both pars and par_names are provided
+        if pars is not None:
+            if par_names is not None:
+                self.par_names = par_names
+            elif self.par_names is None:
+                self.par_names = pars.columns.tolist()
+        
+        # Filter observation data to specified columns
+        sim_obs_filtered = sim_obs[self.obs_names].copy()
+        
+        # Store parameter information if provided
+        if pars is not None and self.par_names is not None:
+            # Filter parameter data to specified columns
+            pars_filtered = pars[self.par_names].copy()
+            
+            # Store min/max values for parameters for later checks
+            self.min_max = {}
+            for col in pars_filtered.columns:
+                self.min_max[col] = (pars_filtered[col].min(), pars_filtered[col].max())
+                
+            # Compute mean parameter vector
+            self.par_vec = pars_filtered.mean()
+            
+            # Note: KDTree is created only when needed for prediction, not here
+        
+        # Compute mean observation vector
+        self.obs_vec = sim_obs_filtered.mean()
+        
+        # Center observation data
+        obs_centered = sim_obs_filtered - self.obs_vec.values
+        
+        # Store transformed data
+        self.sim_vals = sim_obs_filtered
+        
+        # Organize data by type
+        self.organized_obs = self._organize_data_types(obs_centered)
+        
+        self.logger.statement("Data prepared for training")
+        
+    def _organize_data_types(self, df):
+        """
+        Organize observation data into different types based on data_type_map.
+        
+        This method transforms a flat DataFrame into a structured dictionary
+        according to the data types specified in data_type_map.
+        
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            DataFrame containing observation data (rows are realizations)
+        
         Returns
         -------
         dict
-            Dictionary with the following structure:
+            Dictionary with keys for different data types:
             {
-                'scalar': pandas.DataFrame,  # All scalar columns
-                'timeseries': {
-                    'group1': {
-                        'data': pandas.DataFrame,  # Columns for first time series
-                        'coordinates': [t1, t2, ...],  # Corresponding time coordinates
-                        'metadata': {}  # Additional metadata like frequency, etc.
-                    },
-                    'group2': {...},
-                    ...
+                'input_shapes': {
+                    'scalar': (num_scalar_features,),
+                    'timeseries': [(length1, features1), (length2, features2), ...],
+                    'spatial': [(height1, width1, channels1), ...],
                 },
-                'spatial': {
-                    'group1': {
-                        'data': pandas.DataFrame,  # Columns for first spatial dataset
-                        'coordinates': [(x1,y1,z1), (x2,y2,z2), ...],  # Corresponding spatial coordinates
-                        'metadata': {}  # Additional metadata like dimensions, spacing, etc.
-                    },
-                    'group2': {...},
-                    ...
-                }
+                'output_shapes': Same structure as input_shapes,
+                'tensor_inputs': [tensor1, tensor2, ...],  # PyTorch tensors ready for model
+                'column_groups': [(data_type, group_name, columns), ...], # Column organization for reconstruction
             }
         """
-        if not self.data_type_map:
-            # If no data type map is provided, treat all as scalar
-            self.logger.statement("No data_type_map provided, treating all columns as scalar")
-            return {'scalar': data, 'timeseries': {}, 'spatial': {}}
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("Input must be a pandas DataFrame")
         
-        # Initialize result structure
+        # Create default data_type_map if not provided
+        if not self.data_type_map:
+            self.data_type_map = {'scalar': df.columns.tolist()}
+        
+        # Initialize result dictionary
         result = {
-            'scalar': pd.DataFrame(index=data.index),
-            'timeseries': {},
-            'spatial': {}
+            'input_shapes': {
+                'scalar': (0,)
+            },
+            'output_shapes': {
+                'scalar': (0,)
+            },
+            'tensor_inputs': [],
+            'column_groups': []
         }
         
-        # Keep track of processed columns to identify any missing ones
-        processed_columns = set()
-        
-        # Process scalar columns
+        # Process scalar data
         if 'scalar' in self.data_type_map and self.data_type_map['scalar']:
-            scalar_cols = [col for col in self.data_type_map['scalar'] if col in data.columns]
-            if scalar_cols:
-                result['scalar'] = data[scalar_cols].copy()
-                processed_columns.update(scalar_cols)
-            else:
-                self.logger.statement("No valid scalar columns found in data_type_map")
-        
-        # Process time series data with new structure
-        if 'timeseries' in self.data_type_map and self.data_type_map['timeseries']:
-            for group, group_info in self.data_type_map['timeseries'].items():
-                # Check if the group_info is a dict (new format) or list/array (old format)
-                if isinstance(group_info, dict):
-                    # New format with coordinates
-                    if 'columns' not in group_info:
-                        self.logger.warn(f"No 'columns' field found in timeseries group '{group}'")
-                        continue
-
-                    # Get columns and check which ones exist in the data
-                    columns = group_info['columns']
-                    valid_cols = [col for col in columns if col in data.columns]
+            scalar_cols = self.data_type_map['scalar']
+            if scalar_cols and len(scalar_cols) > 0:
+                # Check if all columns exist
+                missing = [col for col in scalar_cols if col not in df.columns]
+                if missing:
+                    raise ValueError(f"Missing scalar columns in dataframe: {missing}")
                     
-                    if not valid_cols:
-                        self.logger.warn(f"No valid columns found for timeseries group '{group}'")
-                        continue
-                        
-                    # Extract coordinates if available
-                    coordinates = group_info.get('coordinates', None)
-                    
-                    if coordinates is not None:
-                        # Validate coordinates length matches columns length
-                        if len(coordinates) != len(valid_cols):
-                            self.logger.warn(
-                                f"Length of coordinates ({len(coordinates)}) "
-                                f"doesn't match length of valid columns ({len(valid_cols)}) "
-                                f"for timeseries group '{group}'"
-                            )
-                            # Use only the coordinates that match valid columns
-                            coordinates = coordinates[:len(valid_cols)]
-                    
-                    # Extract additional metadata
-                    metadata = {
-                        k: v for k, v in group_info.items() 
-                        if k not in ('columns', 'coordinates')
-                    }
-                    
-                    # Store data, coordinates and metadata
-                    result['timeseries'][group] = {
-                        'data': data[valid_cols].copy(),
-                        'coordinates': coordinates,
-                        'metadata': metadata
-                    }
-                    
-                else:
-                    # Old format (list of columns)
-                    columns = group_info
-                    valid_cols = [col for col in columns if col in data.columns]
-                    
-                    if not valid_cols:
-                        self.logger.warn(f"No valid columns found for timeseries group '{group}'")
-                        continue
-                        
-                    # Store data with no coordinates or metadata
-                    result['timeseries'][group] = {
-                        'data': data[valid_cols].copy(),
-                        'coordinates': None,
-                        'metadata': {}
-                    }
-                    
-                # Mark columns as processed
-                processed_columns.update(valid_cols)
-        
-        # Process spatial data with new structure
-        if 'spatial' in self.data_type_map and self.data_type_map['spatial']:
-            for group, group_info in self.data_type_map['spatial'].items():
-                # Check if the group_info is a dict (new format) or list/array (old format)
-                if isinstance(group_info, dict):
-                    # New format with coordinates
-                    if 'columns' not in group_info:
-                        self.logger.warn(f"No 'columns' field found in spatial group '{group}'")
-                        continue
-                        
-                    # Get columns and check which ones exist in the data
-                    columns = group_info['columns']
-                    valid_cols = [col for col in columns if col in data.columns]
-                    
-                    if not valid_cols:
-                        self.logger.warn(f"No valid columns found for spatial group '{group}'")
-                        continue
-                        
-                    # Extract coordinates if available
-                    coordinates = group_info.get('coordinates', None)
-                    
-                    if coordinates is not None:
-                        # Validate coordinates length matches columns length
-                        if len(coordinates) != len(valid_cols):
-                            self.logger.warn(
-                                f"Length of coordinates ({len(coordinates)}) "
-                                f"doesn't match length of valid columns ({len(valid_cols)}) "
-                                f"for spatial group '{group}'"
-                            )
-                            # Use only the coordinates that match valid columns
-                            coordinates = coordinates[:len(valid_cols)]
-                    
-                    # Extract additional metadata
-                    metadata = {
-                        k: v for k, v in group_info.items() 
-                        if k not in ('columns', 'coordinates')
-                    }
-                    
-                    # Store data, coordinates and metadata
-                    result['spatial'][group] = {
-                        'data': data[valid_cols].copy(),
-                        'coordinates': coordinates,
-                        'metadata': metadata
-                    }
-                    
-                else:
-                    # Old format (list of columns)
-                    columns = group_info
-                    valid_cols = [col for col in columns if col in data.columns]
-                    
-                    if not valid_cols:
-                        self.logger.warn(f"No valid columns found for spatial group '{group}'")
-                        continue
-                        
-                    # Store data with no coordinates or metadata
-                    result['spatial'][group] = {
-                        'data': data[valid_cols].copy(),
-                        'coordinates': None,
-                        'metadata': {}
-                    }
-                    
-                # Mark columns as processed
-                processed_columns.update(valid_cols)
+                # Extract scalar data
+                scalar_data = df[scalar_cols].values
                 
-        # Check if any columns weren't assigned to a data type
-        missing_cols = set(data.columns) - processed_columns
-        if missing_cols:
-            self.logger.warn(f"The following columns were not assigned to any data type and will be treated as scalar: {missing_cols}")
-            if result['scalar'].empty:
-                result['scalar'] = data[list(missing_cols)].copy()
-            else:
-                for col in missing_cols:
-                    result['scalar'][col] = data[col]
+                # Update shapes
+                result['input_shapes']['scalar'] = (scalar_data.shape[1],)
+                result['output_shapes']['scalar'] = (scalar_data.shape[1],)
+                
+                # Convert to tensor
+                scalar_tensor = torch.tensor(scalar_data, dtype=torch.float32, device=self.device)
+                result['tensor_inputs'].append(scalar_tensor)
+                
+                # Store column group
+                result['column_groups'].append(('scalar', 'scalar', scalar_cols))
+                
+                self.logger.statement(f"Prepared {len(scalar_cols)} scalar variables")
+        
+        # Process time series data
+        if 'timeseries' in self.data_type_map and self.data_type_map['timeseries']:
+            ts_data = self.data_type_map['timeseries']
+            
+            result['input_shapes']['timeseries'] = []
+            result['output_shapes']['timeseries'] = []
+            
+            for group_name, group_info in ts_data.items():
+                ts_cols = group_info.get('columns', [])
+                ts_coords = group_info.get('coordinates', [])
+                
+                # Ensure we have coordinates and columns
+                if not ts_cols or not ts_coords:
+                    self.logger.warn(f"Skipping time series group '{group_name}': missing columns or coordinates")
+                    continue
+                    
+                if len(ts_cols) != len(ts_coords):
+                    raise ValueError(f"Time series group '{group_name}' has mismatched columns and coordinates lengths")
+                
+                # Check if all columns exist
+                missing = [col for col in ts_cols if col not in df.columns]
+                if missing:
+                    raise ValueError(f"Missing time series columns in dataframe for group '{group_name}': {missing}")
+                    
+                # Extract time series data
+                ts_values = df[ts_cols].values
+                num_samples = ts_values.shape[0]
+                
+                # Determine shape (samples, time_steps, features)
+                # For regular time series, features=1 (single feature at each time step)
+                # For multivariate time series with the same time base, features>1
+                
+                # Default assumption: each column is a separate time step for a single feature
+                time_steps = len(ts_cols)
+                features = 1
+                
+                # Reshape to match expected input format for 1D convolutions: (samples, time_steps, features)
+                ts_shaped = ts_values.reshape((num_samples, time_steps, features))
+                
+                # Update shapes
+                result['input_shapes']['timeseries'].append((time_steps, features))
+                result['output_shapes']['timeseries'].append((time_steps, features))
+                
+                # Convert to tensor
+                ts_tensor = torch.tensor(ts_shaped, dtype=torch.float32, device=self.device)
+                result['tensor_inputs'].append(ts_tensor)
+                
+                # Store column group
+                result['column_groups'].append(('timeseries', group_name, ts_cols))
+                
+                self.logger.statement(f"Prepared time series group '{group_name}' with {time_steps} time steps")
+        
+        # Process spatial data
+        if 'spatial' in self.data_type_map and self.data_type_map['spatial']:
+            spatial_data = self.data_type_map['spatial']
+            
+            result['input_shapes']['spatial'] = []
+            result['output_shapes']['spatial'] = []
+            
+            for group_name, group_info in spatial_data.items():
+                sp_cols = group_info.get('columns', [])
+                sp_coords = group_info.get('coordinates', [])
+                dimensions = group_info.get('dimensions', None)
+                
+                # Ensure we have coordinates and columns
+                if not sp_cols or not sp_coords:
+                    self.logger.warn(f"Skipping spatial group '{group_name}': missing columns or coordinates")
+                    continue
+                    
+                if len(sp_cols) != len(sp_coords):
+                    raise ValueError(f"Spatial group '{group_name}' has mismatched columns and coordinates lengths")
+                
+                # Check if all columns exist
+                missing = [col for col in sp_cols if col not in df.columns]
+                if missing:
+                    raise ValueError(f"Missing spatial columns in dataframe for group '{group_name}': {missing}")
+                    
+                # Extract spatial data
+                spatial_values = df[sp_cols].values
+                num_samples = spatial_values.shape[0]
+                
+                # Determine grid dimensions if not provided
+                if dimensions is None:
+                    # Try to infer dimensions from coordinates
+                    coords = np.array(sp_coords)
+                    
+                    if coords.ndim > 1 and coords.shape[1] >= 2:
+                        # 2D or 3D coordinates
+                        x_unique = np.unique(coords[:, 0])
+                        y_unique = np.unique(coords[:, 1])
+                        
+                        width = len(x_unique)
+                        height = len(y_unique)
+                        channels = 1  # Default to 1 channel
+                        
+                        if coords.shape[1] >= 3:
+                            # 3D coordinates might have a z dimension or channel dimension
+                            z_unique = np.unique(coords[:, 2])
+                            if len(z_unique) > 1:
+                                # Multiple z values - treat as 3D grid
+                                depth = len(z_unique)
+                                dimensions = (height, width, depth, 1)  # (h, w, d, c)
+                            else:
+                                # Single z value or it represents a channel - treat as 2D grid with channels
+                                dimensions = (height, width, 1)  # (h, w, c)
+                        else:
+                            dimensions = (height, width, 1)  # (h, w, c)
+                    else:
+                        # Unable to infer dimensions, use a 1D representation
+                        self.logger.warn(f"Unable to infer spatial dimensions for group '{group_name}', using flat representation")
+                        dimensions = (len(sp_cols), 1, 1)  # (flat_size, 1, 1)
+                
+                # Ensure we have a 3-tuple for dimensions (h, w, c)
+                if len(dimensions) == 2:
+                    dimensions = (dimensions[0], dimensions[1], 1)  # Add channel dimension
+                elif len(dimensions) == 4:
+                    # 3D grid with channels - flatten depth and height for 2D representation
+                    h, w, d, c = dimensions
+                    dimensions = (h, w * d, c)
+                    self.logger.warn(f"Converting 3D grid to 2D representation for group '{group_name}'")
+                
+                # Reshape spatial data to grid format
+                h, w, c = dimensions
+                grid_size = h * w * c
+                
+                if grid_size != len(sp_cols):
+                    self.logger.warn(
+                        f"Spatial group '{group_name}' dimension mismatch: {dimensions} requires {grid_size} values but {len(sp_cols)} provided"
+                    )
+                    # Try to adjust dimensions
+                    if c == 1:
+                        # Adjust width to make dimensions match
+                        w = len(sp_cols) // (h * c)
+                        dimensions = (h, w, c)
+                        self.logger.warn(f"Adjusted dimensions to {dimensions}")
+                    else:
+                        # Fall back to flat representation
+                        dimensions = (1, len(sp_cols), 1)
+                        self.logger.warn(f"Falling back to flat representation {dimensions}")
+                
+                # Reshape values to match grid dimensions
+                h, w, c = dimensions
+                try:
+                    spatial_shaped = spatial_values.reshape((num_samples, h, w, c))
+                except ValueError:
+                    self.logger.error(
+                        f"Failed to reshape spatial data for group '{group_name}'. "
+                        f"Cannot reshape array of size {spatial_values.size} into shape ({num_samples}, {h}, {w}, {c})"
+                    )
+                    # Fall back to flat representation
+                    spatial_shaped = spatial_values.reshape((num_samples, 1, len(sp_cols), 1))
+                    dimensions = (1, len(sp_cols), 1)
+                    self.logger.warn(f"Falling back to flat representation {dimensions}")
+                
+                # Update shapes
+                result['input_shapes']['spatial'].append(dimensions)
+                result['output_shapes']['spatial'].append(dimensions)
+                
+                # Convert to tensor
+                spatial_tensor = torch.tensor(spatial_shaped, dtype=torch.float32, device=self.device)
+                result['tensor_inputs'].append(spatial_tensor)
+                
+                # Store column group
+                result['column_groups'].append(('spatial', group_name, sp_cols))
+                
+                self.logger.statement(f"Prepared spatial group '{group_name}' with shape {dimensions}")
         
         return result
 
-    def predict(self, pars, nsamples=0, return_variance=False):
+    def _build_kdtree(self):
         """
-        Predict observations from parameter values using the DSIAE emulator.
+        Build KDTree for parameter space lookup.
+        This is only needed for prediction, not for training the autoencoder.
+        
+        Returns
+        -------
+        bool
+            True if KDTree was built successfully, False otherwise.
+        """
+        # Check if we have parameter data
+        if self.pars is None or self.par_names is None:
+            self.logger.statement("No parameter data available to build KDTree")
+            return False
+            
+        # Filter parameter data to specified columns
+        pars_filtered = self.pars[self.par_names].copy()
+        
+        # Create KDTree for parameter space
+        self.kdtree = cKDTree(pars_filtered.values)
+        self.logger.statement("KDTree built for parameter space")
+        
+        return True
+
+    def _build_model(self):
+        """
+        Build the variational autoencoder model based on the organized data.
+        
+        This method creates the encoder and decoder components of the VAE based on
+        the data_type_map and organized observation data.
+        
+        Returns
+        -------
+        None
+        """
+        if self.organized_obs is None:
+            raise ValueError("No organized observation data available. Call prepare_data first.")
+            
+        # Get input and output shapes from organized data
+        input_shapes = self.organized_obs['input_shapes']
+        output_shapes = self.organized_obs['output_shapes']
+        
+        # Create encoder and decoder
+        self.logger.statement(f"Building encoder with latent dim {self.latent_dim}")
+        self.encoder = Encoder(input_shapes, latent_dim=self.latent_dim)
+        
+        self.logger.statement("Building decoder")
+        self.decoder = Decoder(self.latent_dim, output_shapes)
+        
+        # Create complete VAE model
+        self.vae = VariationalAutoEncoder(input_shapes, output_shapes, latent_dim=self.latent_dim)
+        
+        # Move models to the specified device
+        self.encoder.to(self.device)
+        self.decoder.to(self.device)
+        self.vae.to(self.device)
+        
+        # Set up optimizer
+        self.optimizer = optim.Adam(self.vae.parameters(), lr=self.learning_rate)
+        
+        self.logger.statement("Model built successfully")
+        return
+
+    def predict(self, par_vals=None):
+        """
+        Predict observations for a set of parameter values.
+        
+        This method uses the nearest neighbor approach from the parameter space
+        to map to the latent space, then decodes to generate predictions.
         
         Parameters
         ----------
-        pars : pandas.DataFrame or pandas.Series
-            Parameter values to predict from.
-        nsamples : int, optional
-            Number of samples to draw for stochastic simulation. If 0, returns the mean prediction.
-        return_variance : bool, optional
-            If True, also return variance of the predictions. Default is False.
+        par_vals : pandas.DataFrame or numpy.ndarray, optional
+            Parameter values to predict for. Must have the same column names/order as training parameters.
+            If None, the parameter data provided during initialization or preparation will be used.
             
         Returns
         -------
         pandas.DataFrame
-            Predicted observations for the input parameters.
-        pandas.DataFrame, optional
-            Variance of the predictions, only if return_variance is True.
+            Predicted observations.
         """
         if not self.fitted:
-            raise ValueError("Emulator must be fitted before prediction")
-        
-        # Handle both DataFrame and Series inputs
-        if isinstance(pars, pd.Series):
-            pars = pars.to_frame().T
-        
-        # Ensure we have the right parameters
-        if self.par_names is not None:
-            missing_pars = set(self.par_names) - set(pars.columns)
-            if missing_pars:
-                raise ValueError(f"Missing parameters: {missing_pars}")
-            pars = pars[self.par_names]
+            raise ValueError("Model must be fitted before prediction")
             
-        # Check if parameters are within training range
-        for par_name in pars.columns:
-            if par_name in self.min_max:
-                min_val, max_val = self.min_max[par_name]
-                if (pars[par_name] < min_val).any() or (pars[par_name] > max_val).any():
-                    self.logger.warn(f"Parameter {par_name} includes values outside the training range")
-        
-        # Find nearest neighbors in parameter space
-        distances, indices = self.kdtree.query(pars.values, k=5)  # Get 5 nearest neighbors
-        
-        # Get observations for nearest neighbors
-        nearest_obs = self.sim_vals.iloc[indices[:, 0]].copy()
-        nearest_obs.index = pars.index  # Match indices with input parameters
-        
-        # Calculate deviations from mean observation vector for nearest neighbors
-        nearest_obs_dev = nearest_obs - self.obs_vec.values
-        
-        # Organize nearest observations by data type
-        organized_nearest_obs = self._organize_data_types(nearest_obs_dev)
-        
-        # Prepare inputs for the autoencoder (encoder)
-        encoder_inputs = []
-        
-        # Add scalar input if needed
-        if 'scalar' in organized_nearest_obs and not organized_nearest_obs['scalar'].empty:
-            encoder_inputs.append(organized_nearest_obs['scalar'].values)
+        # Check if we have parameter data
+        if par_vals is None:
+            # If no parameter values are provided, use the training parameters
+            if self.pars is None:
+                raise ValueError("No parameter values provided for prediction and no training parameters available")
+            par_vals = self.pars
             
-        # Add time series inputs with coordinates
-        if 'timeseries' in organized_nearest_obs:
-            for group, group_data in organized_nearest_obs['timeseries'].items():
-                encoder_inputs.append(group_data['data'].values)
+        # Convert to DataFrame if ndarray
+        if isinstance(par_vals, np.ndarray):
+            if self.par_names is None:
+                raise ValueError("Parameter names must be provided when passing array-like parameter values")
                 
-        # Add spatial inputs with coordinates
-        if 'spatial' in organized_nearest_obs:
-            for group, group_data in organized_nearest_obs['spatial'].items():
-                encoder_inputs.append(group_data['data'].values)
-        
-        # Encode to get the latent representation
-        self.logger.statement("Encoding nearest neighbor observations to latent space")
-        latent_mean, latent_log_var, latent_sample = self.encoder.predict(
-            encoder_inputs, 
-            verbose=0
-        )
-        
-        # If requesting samples, generate multiple latent codes
-        if nsamples > 0:
-            self.logger.statement(f"Generating {nsamples} samples from latent space")
-            latent_samples = []
+            assert par_vals.shape[1] == len(self.par_names), "Input data must have same dimensions as training parameters"
+            par_vals = pd.DataFrame(par_vals, columns=self.par_names)
             
-            # Generate samples from the latent distribution
-            for _ in range(nsamples):
-                # Sample from the latent space using mean and log variance
-                epsilon = np.random.normal(size=latent_mean.shape)
-                z_sample = latent_mean + np.exp(0.5 * latent_log_var) * epsilon
-                latent_samples.append(z_sample)
-                
-            # Decode each sample
-            decoded_samples = []
-            for z_sample in latent_samples:
-                decoder_outputs = self.decoder.predict(z_sample, verbose=0)
-                
-                # Combine outputs into a single DataFrame
-                decoded_df = self._combine_decoder_outputs(decoder_outputs)
-                
-                # Add the mean observations to get the final predictions
-                pred_sample = decoded_df + self.obs_vec.values
-                
-                decoded_samples.append(pred_sample)
-                
-            # Return either a single DataFrame or a list, depending on number of samples
-            if len(decoded_samples) == 1:
-                return decoded_samples[0]
-            else:
-                return pd.concat(decoded_samples, axis=0)
-        
-        # For normal prediction without sampling, use the mean latent representation
-        self.logger.statement("Decoding from latent space to observation space")
-        decoder_outputs = self.decoder.predict(latent_mean, verbose=0)
-        
-        # Combine the decoder outputs into a single DataFrame
-        decoded_df = self._combine_decoder_outputs(decoder_outputs)
-        
-        # Add the mean observations to get the final predictions
-        pred = decoded_df + self.obs_vec.values
-        
-        if return_variance:
-            # If variance requested, compute variance based on latent space uncertainty
-            self.logger.statement("Computing prediction variance")
-            # Sample multiple times from the latent distribution and compute variance
-            n_var_samples = 10
-            var_samples = []
+        # Ensure all required columns are present
+        missing = [col for col in self.par_names if col not in par_vals.columns]
+        if missing:
+            raise ValueError(f"Missing columns in input data: {missing}")
             
-            for _ in range(n_var_samples):
-                # Sample from the latent space
-                epsilon = np.random.normal(size=latent_mean.shape)
-                z_sample = latent_mean + np.exp(0.5 * latent_log_var) * epsilon
-                
-                # Decode this sample
-                var_decoder_outputs = self.decoder.predict(z_sample, verbose=0)
-                var_decoded_df = self._combine_decoder_outputs(var_decoder_outputs)
-                var_pred = var_decoded_df + self.obs_vec.values
-                
-                var_samples.append(var_pred)
-                
-            # Compute variance across samples
-            var_stack = np.stack([df.values for df in var_samples], axis=0)
-            variance = pd.DataFrame(
-                np.var(var_stack, axis=0),
-                index=pred.index,
-                columns=pred.columns
-            )
-            
-            return pred, variance
-        else:
-            return pred
-            
-    def _combine_decoder_outputs(self, decoder_outputs):
-        """
-        Combine multiple decoder outputs into a single DataFrame.
-        
-        Parameters
-        ----------
-        decoder_outputs : list
-            List of numpy arrays from the decoder model outputs.
-            
-        Returns
-        -------
-        pandas.DataFrame
-            Combined DataFrame of all decoder outputs.
-        """
-        combined_columns = []
-        combined_data = None
-        output_idx = 0
-        
-        # Handle scalar outputs
-        if 'scalar' in self.organized_obs and not self.organized_obs['scalar'].empty:
-            scalar_data = decoder_outputs[output_idx]
-            scalar_cols = self.organized_obs['scalar'].columns
-            
-            if combined_data is None:
-                combined_data = scalar_data
-                combined_columns.extend(scalar_cols)
-            else:
-                # This branch shouldn't normally execute for the first output
-                combined_data = np.concatenate((combined_data, scalar_data), axis=1)
-                combined_columns.extend(scalar_cols)
-                
-            output_idx += 1
-            
-        # Handle time series outputs with coordinates
-        if 'timeseries' in self.organized_obs:
-            for group, group_data in self.organized_obs['timeseries'].items():
-                ts_data = decoder_outputs[output_idx]
-                ts_cols = group_data['data'].columns
-                
-                if combined_data is None:
-                    combined_data = ts_data
-                    combined_columns.extend(ts_cols)
-                else:
-                    combined_data = np.concatenate((combined_data, ts_data), axis=1)
-                    combined_columns.extend(ts_cols)
+        # Check parameter bounds
+        for col in self.par_names:
+            if col in self.min_max:
+                min_val, max_val = self.min_max[col]
+                if par_vals[col].min() < min_val or par_vals[col].max() > max_val:
+                    self.logger.warn(f"Parameter {col} has values outside training range. Extrapolation may be unreliable.")
                     
-                output_idx += 1
+        # Build KDTree if not already built
+        if self.kdtree is None:
+            success = self._build_kdtree()
+            if not success:
+                raise ValueError("Failed to build KDTree for prediction. Parameter data must be provided.")
                 
-        # Handle spatial outputs with coordinates
-        if 'spatial' in self.organized_obs:
-            for group, group_data in self.organized_obs['spatial'].items():
-                spatial_data = decoder_outputs[output_idx]
-                spatial_cols = group_data['data'].columns
-                
-                if combined_data is None:
-                    combined_data = spatial_data
-                    combined_columns.extend(spatial_cols)
-                else:
-                    combined_data = np.concatenate((combined_data, spatial_data), axis=1)
-                    combined_columns.extend(spatial_cols)
-                    
-                output_idx += 1
-                
-        # Create DataFrame with the right column order
-        result = pd.DataFrame(
-            combined_data,
-            columns=combined_columns
-        )
+        # Query the KDTree for nearest neighbors
+        distances, indices = self.kdtree.query(par_vals[self.par_names].values, k=1)
         
-        # Ensure output columns match the expected order
-        if self.obs_names:
-            if not all(col in result.columns for col in self.obs_names):
-                missing = [col for col in self.obs_names if col not in result.columns]
-                self.logger.warn(f"Some observation columns are missing in decoder output: {missing}")
-            
-            # Only include columns that actually exist in the result
-            valid_obs_names = [col for col in self.obs_names if col in result.columns]
-            result = result[valid_obs_names]
+        # Get the encoder inputs for the nearest neighbors
+        neighbor_obs = self.sim_obs.iloc[indices]
         
-        return result
+        # Encode to latent space and decode to get predictions
+        latent_vectors = self.encode(neighbor_obs)
+        predictions = self.decode(latent_vectors)
+        
+        return predictions
 
-    def encode(self, data):
+    def fit(self, 
+            epochs=100, 
+            batch_size=32, 
+            beta=1.0, 
+            beta_annealing=True, 
+            validation_split=0.2, 
+            early_stopping=True, 
+            patience=10, 
+            return_history=False):
         """
-        Map data to latent space representation.
+        Train the variational autoencoder on the provided data.
         
         Parameters
         ----------
-        data : pandas.DataFrame
-            Data to encode. Must contain columns matching those used during training.
+        epochs : int, optional
+            Number of training epochs. Default is 100.
+        batch_size : int, optional
+            Batch size for training. Default is 32.
+        beta : float, optional
+            Weight for KL divergence loss term. Default is 1.0.
+        beta_annealing : bool, optional
+            Whether to use KL divergence annealing during training. Default is True.
+        validation_split : float, optional
+            Fraction of data to use for validation. Default is 0.2.
+        early_stopping : bool, optional
+            Whether to use early stopping during training. Default is True.
+        patience : int, optional
+            Number of epochs to wait for improvement before stopping. Default is 10.
+        return_history : bool, optional
+            Whether to return the training history. Default is False.
             
         Returns
         -------
-        tuple
-            (z_mean, z_log_var, z_sample) - latent space representations:
-            z_mean: mean values of the latent space
-            z_log_var: log variance values of the latent space
-            z_sample: sampled latent vectors
+        dict or self
+            If return_history is True, returns a dictionary containing training history.
+            Otherwise returns self.
         """
-        if not self.fitted or self.encoder is None:
-            raise ValueError("Emulator must be fitted before encoding")
+        if self.organized_obs is None:
+            raise ValueError("No organized observation data available. Call prepare_data first.")
+
+        if self.encoder is None or self.decoder is None or self.vae is None:
+            self._build_model()
+
+        # Get training data
+        train_data = self.organized_obs['tensor_inputs']
+        
+        # Create PyTorch Dataset and DataLoader
+        train_dataset = torch.utils.data.TensorDataset(*train_data)
+        
+        # Split into training and validation
+        dataset_size = len(train_dataset)
+        val_size = int(validation_split * dataset_size)
+        train_size = dataset_size - val_size
+        
+        train_subset, val_subset = torch.utils.data.random_split(
+            train_dataset, [train_size, val_size]
+        )
+        
+        train_loader = torch.utils.data.DataLoader(
+            train_subset, batch_size=batch_size, shuffle=True
+        )
+        
+        val_loader = torch.utils.data.DataLoader(
+            val_subset, batch_size=batch_size, shuffle=False
+        )
+        
+        self.logger.statement(f"Training on {train_size} samples, validating on {val_size} samples")
+        
+        # Set up early stopping
+        if early_stopping:
+            best_val_loss = float('inf')
+            best_model_state = None
+            counter = 0
+        
+        # Training loop
+        for epoch in range(epochs):
+            # Set up KL annealing if enabled
+            current_beta = beta
+            if beta_annealing:
+                # Gradually increase beta from 0 to target value over first half of epochs
+                current_beta = beta * min(1.0, epoch / (epochs / 2))
             
-        # Center the data using the mean observation vector
-        data_centered = data - self.obs_vec.values
+            # Training phase
+            self.vae.train()
+            train_total_loss = 0
+            train_recon_loss = 0
+            train_kl_loss = 0
+            
+            for batch_idx, batch_data in enumerate(train_loader):
+                self.optimizer.zero_grad()
+                
+                # Forward pass
+                outputs, z_mean, z_log_var, z = self.vae(batch_data)
+                
+                # Calculate reconstruction loss
+                recon_loss = 0
+                for i, (output, target) in enumerate(zip(outputs, batch_data)):
+                    # Handle mismatched shapes by ensuring shapes match before calculating loss
+                    if output.shape != target.shape:
+                        # Adjust output shape to match target shape if they're compatible
+                        # This usually happens when batched tensors have different sequence lengths
+                        if output.numel() == target.numel():
+                            output = output.view(target.shape)
+                        else:
+                            # If number of elements don't match, use a safe fallback
+                            self.logger.warn(
+                                f"Shape mismatch in tensor {i}: output {output.shape} vs target {target.shape}. "
+                                f"Using element-wise loss on shared dimensions."
+                            )
+                            # Find minimum dimensions
+                            min_shape = [min(s1, s2) for s1, s2 in zip(output.shape, target.shape)]
+                            
+                            # Create slices for each dimension
+                            slices_output = tuple(slice(0, s) for s in min_shape)
+                            slices_target = tuple(slice(0, s) for s in min_shape)
+                            
+                            # Use matching portions of tensors
+                            output_slice = output[slices_output]
+                            target_slice = target[slices_target]
+                            
+                            # Calculate loss on matching portions
+                            recon_loss += F.mse_loss(output_slice, target_slice, reduction='sum')
+                            continue
+                            
+                    # Use mean squared error for reconstruction loss
+                    recon_loss += F.mse_loss(output, target, reduction='sum')
+                
+                # Calculate KL divergence loss
+                kl_loss = -0.5 * torch.sum(1 + z_log_var - z_mean.pow(2) - z_log_var.exp())
+                
+                # Total loss with beta weighting for KL term
+                loss = recon_loss + current_beta * kl_loss
+                
+                # Backward pass and optimization
+                loss.backward()
+                self.optimizer.step()
+                
+                # Accumulate losses
+                train_total_loss += loss.item()
+                train_recon_loss += recon_loss.item()
+                train_kl_loss += kl_loss.item()
+            
+            # Normalize losses by dataset size
+            train_total_loss /= train_size
+            train_recon_loss /= train_size
+            train_kl_loss /= train_size
+            
+            # Validation phase
+            self.vae.eval()
+            val_total_loss = 0
+            val_recon_loss = 0
+            val_kl_loss = 0
+            
+            with torch.no_grad():
+                for batch_idx, batch_data in enumerate(val_loader):
+                    # Forward pass
+                    outputs, z_mean, z_log_var, z = self.vae(batch_data)
+                    
+                    # Calculate reconstruction loss
+                    recon_loss = 0
+                    for i, (output, target) in enumerate(zip(outputs, batch_data)):
+                        # Handle mismatched shapes the same way as in training
+                        if output.shape != target.shape:
+                            # Adjust output shape to match target shape if they're compatible
+                            if output.numel() == target.numel():
+                                output = output.view(target.shape)
+                            else:
+                                # Find minimum dimensions
+                                min_shape = [min(s1, s2) for s1, s2 in zip(output.shape, target.shape)]
+                                
+                                # Create slices for each dimension
+                                slices_output = tuple(slice(0, s) for s in min_shape)
+                                slices_target = tuple(slice(0, s) for s in min_shape)
+                                
+                                # Use matching portions of tensors
+                                output_slice = output[slices_output]
+                                target_slice = target[slices_target]
+                                
+                                # Calculate loss on matching portions
+                                recon_loss += F.mse_loss(output_slice, target_slice, reduction='sum')
+                                continue
+                        
+                        recon_loss += F.mse_loss(output, target, reduction='sum')
+                    
+                    # Calculate KL divergence loss
+                    kl_loss = -0.5 * torch.sum(1 + z_log_var - z_mean.pow(2) - z_log_var.exp())
+                    
+                    # Total loss with beta weighting for KL term
+                    loss = recon_loss + current_beta * kl_loss
+                    
+                    # Accumulate losses
+                    val_total_loss += loss.item()
+                    val_recon_loss += recon_loss.item()
+                    val_kl_loss += kl_loss.item()
+                
+                # Normalize losses by validation set size
+                val_total_loss /= val_size
+                val_recon_loss /= val_size
+                val_kl_loss /= val_size
+            
+            # Log progress
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                self.logger.statement(
+                    f"Epoch {epoch+1}/{epochs}, Beta: {current_beta:.4f}, "
+                    f"Train: Loss={train_total_loss:.4f}, Recon={train_recon_loss:.4f}, KL={train_kl_loss:.4f}, "
+                    f"Val: Loss={val_total_loss:.4f}, Recon={val_recon_loss:.4f}, KL={val_kl_loss:.4f}"
+                )
+            
+            # Early stopping check
+            if early_stopping:
+                if val_total_loss < best_val_loss:
+                    best_val_loss = val_total_loss
+                    best_model_state = copy.deepcopy(self.vae.state_dict())
+                    counter = 0
+                else:
+                    counter += 1
+                    
+                if counter >= patience:
+                    self.logger.statement(f"Early stopping at epoch {epoch+1}")
+                    # Restore best model
+                    self.vae.load_state_dict(best_model_state)
+                    break
+            
+            # Record history
+            self.training_history['total_loss'].append(train_total_loss)
+            self.training_history['reconstruction_loss'].append(train_recon_loss)
+            self.training_history['kl_loss'].append(train_kl_loss)
+            self.training_history['val_total_loss'].append(val_total_loss)
+            self.training_history['val_reconstruction_loss'].append(val_recon_loss)
+            self.training_history['val_kl_loss'].append(val_kl_loss)
         
-        # Organize data by type
-        organized_data = self._organize_data_types(data_centered)
+        self.fitted = True
         
-        # Prepare encoder inputs
-        encoder_inputs = []
+        if return_history:
+            return self.training_history
+        else:
+            return self
+
+    def encode(self, obs_data):
+        """
+        Encode observation data into the latent space.
         
-        # Add scalar input
-        if 'scalar' in organized_data and not organized_data['scalar'].empty:
-            encoder_inputs.append(organized_data['scalar'].values)
+        Parameters
+        ----------
+        obs_data : pandas.DataFrame
+            Observation data to encode. Must have the same columns as the training data.
+            
+        Returns
+        -------
+        numpy.ndarray
+            Latent space representation of the input data.
+        """
+        if self.vae is None:
+            raise ValueError("Model has not been built yet. Call _build_model() first.")
         
-        # Add time series inputs
-        if 'timeseries' in organized_data:
-            for group, group_data in organized_data['timeseries'].items():
-                encoder_inputs.append(group_data['data'].values)
+        if not isinstance(obs_data, pd.DataFrame):
+            raise TypeError("Input must be a pandas DataFrame")
+            
+        # Check that all columns are present
+        missing = [col for col in self.obs_names if col not in obs_data.columns]
+        if missing:
+            raise ValueError(f"Missing columns in observation data: {missing}")
+            
+        # Center data using the training mean
+        if self.obs_vec is None:
+            raise ValueError("Mean observation vector is not available. Train the model first.")
+            
+        obs_centered = obs_data[self.obs_names] - self.obs_vec.values
         
-        # Add spatial inputs
-        if 'spatial' in organized_data:
-            for group, group_data in organized_data['spatial'].items():
-                encoder_inputs.append(group_data['data'].values)
+        # Organize data types
+        organized_data = self._organize_data_types(obs_centered)
         
+        # Get tensor inputs
+        tensor_inputs = organized_data['tensor_inputs']
+        
+        # Set model to evaluation mode
+        self.vae.eval()
+        self.encoder.eval()
+        print(tensor_inputs[0].shape)
         # Encode to latent space
-        z_mean, z_log_var, z_sample = self.encoder.predict(encoder_inputs, verbose=0)
-        
-        return z_mean, z_log_var, z_sample
+        with torch.no_grad():
+            z_mean, z_log_var, z = self.encoder(tensor_inputs)
+            
+        # Return as numpy array
+        return z.cpu().numpy()
         
     def decode(self, latent_vectors):
         """
-        Map from latent space back to data space.
+        Decode latent space vectors back to observation space.
         
         Parameters
         ----------
-        latent_vectors : numpy.ndarray
+        latent_vectors : numpy.ndarray or torch.Tensor
             Latent space vectors to decode.
             
         Returns
         -------
         pandas.DataFrame
-            Decoded data with original column names.
+            Reconstructed observations in the original data space.
         """
-        if not self.fitted or self.decoder is None:
-            raise ValueError("Emulator must be fitted before decoding")
+        if self.vae is None:
+            raise ValueError("Model has not been built yet. Call _build_model() first.")
             
-        # Generate predictions from latent vectors
-        decoder_outputs = self.decoder.predict(latent_vectors, verbose=0)
+        # Convert to tensor if needed
+        if isinstance(latent_vectors, np.ndarray):
+            z = torch.tensor(latent_vectors, dtype=torch.float32, device=self.device)
+        else:
+            z = latent_vectors
+            
+        # Set model to evaluation mode
+        self.vae.eval()
+        self.decoder.eval()
         
-        # Combine outputs into a single DataFrame
-        decoded_df = self._combine_decoder_outputs(decoder_outputs)
+        # Decode from latent space
+        with torch.no_grad():
+            outputs = self.decoder(z)
+            
+        # Initialize DataFrame for results
+        result = pd.DataFrame(index=range(len(z)), columns=self.obs_names)
         
-        # Add the mean observations to get the final values
-        result = decoded_df + self.obs_vec.values
+        # Process outputs and organize back into DataFrame
+        col_idx = 0
+        for i, (data_type, group_name, columns) in enumerate(self.organized_obs['column_groups']):
+            output_tensor = outputs[i]
+            
+            # Reshape tensor based on data type
+            if data_type == 'scalar':
+                # Scalar data is already in the right shape
+                output_values = output_tensor.cpu().numpy()
+                for j, col in enumerate(columns):
+                    result[col] = output_values[:, j]
+                    
+            elif data_type == 'timeseries':
+                # Time series data needs to be flattened to columns
+                output_values = output_tensor.cpu().numpy()
+                num_samples = output_values.shape[0]
+                time_steps = output_values.shape[1]
+                features = output_values.shape[2] if output_values.ndim > 2 else 1
+                
+                # Check if we have the right number of elements
+                expected_cols = len(columns)
+                actual_cols = time_steps * features if output_values.ndim > 2 else time_steps
+                
+                if actual_cols != expected_cols:
+                    self.logger.warn(
+                        f"Time series dimension mismatch for group '{group_name}': "
+                        f"expected {expected_cols} columns but got {actual_cols} values"
+                    )
+                
+                # Reshape based on features dimension
+                if features == 1 or output_values.ndim == 2:
+                    # Single feature per time step case
+                    output_flat = output_values.reshape((num_samples, -1))
+                    # Ensure we have the right number of columns (truncate or pad if necessary)
+                    if output_flat.shape[1] != expected_cols:
+                        if output_flat.shape[1] > expected_cols:
+                            output_flat = output_flat[:, :expected_cols]
+                        else:
+                            # Pad with zeros
+                            pad_width = expected_cols - output_flat.shape[1]
+                            output_flat = np.pad(output_flat, ((0, 0), (0, pad_width)))
+                else:
+                    # Multiple features case
+                    output_flat = output_values.reshape((num_samples, -1))
+                    if output_flat.shape[1] != expected_cols:
+                        if output_flat.shape[1] > expected_cols:
+                            output_flat = output_flat[:, :expected_cols]
+                        else:
+                            # Pad with zeros
+                            pad_width = expected_cols - output_flat.shape[1]
+                            output_flat = np.pad(output_flat, ((0, 0), (0, pad_width)))
+                
+                # Assign to DataFrame
+                for j, col in enumerate(columns):
+                    if j < output_flat.shape[1]:
+                        result[col] = output_flat[:, j]
+                        
+            elif data_type == 'spatial':
+                # Spatial data needs to be flattened to columns
+                output_values = output_tensor.cpu().numpy()
+                num_samples = output_values.shape[0]
+                
+                # Flatten spatial dimensions
+                output_flat = output_values.reshape((num_samples, -1))
+                
+                # The number of flattened elements should match the number of columns
+                if output_flat.shape[1] != len(columns):
+                    self.logger.warn(
+                        f"Mismatch between flattened spatial output ({output_flat.shape[1]}) "
+                        f"and number of columns ({len(columns)})"
+                    )
+                    # Try to adjust if possible
+                    if output_flat.shape[1] > len(columns):
+                        output_flat = output_flat[:, :len(columns)]
+                    else:
+                        # Pad with zeros
+                        pad_width = len(columns) - output_flat.shape[1]
+                        output_flat = np.pad(output_flat, ((0, 0), (0, pad_width)))
+                
+                for j, col in enumerate(columns):
+                    result[col] = output_flat[:, j]
+        
+        # Un-center data using the training mean
+        result += self.obs_vec.values
         
         return result
-        
-    def plot_latent_space(self, n_samples=1000, dimensions=(0, 1), figsize=(10, 8)):
+    
+    def generate(self, n_samples=1, std_dev=1.0):
         """
-        Visualize the latent space of the autoencoder by projecting to 2D.
+        Generate new samples by sampling from the latent space.
         
         Parameters
         ----------
         n_samples : int, optional
-            Number of samples to use for visualization. Default is 1000.
-        dimensions : tuple, optional
-            The latent space dimensions to plot (as x, y). Default is (0, 1).
-        figsize : tuple, optional
-            Figure size. Default is (10, 8).
+            Number of samples to generate. Default is 1.
+        std_dev : float, optional
+            Standard deviation of the normal distribution to sample from.
+            Controls the diversity of generated samples. Default is 1.0.
             
         Returns
         -------
-        matplotlib.figure.Figure
-            The created figure.
+        pandas.DataFrame
+            Generated observation samples.
         """
-        if not self.fitted or self.encoder is None:
-            raise ValueError("Emulator must be fitted before plotting latent space")
+        if self.vae is None:
+            raise ValueError("Model has not been built yet. Call _build_model() first.")
             
-        # Limit number of samples to available data
-        n_samples = min(n_samples, len(self.sim_vals))
+        # Sample from normal distribution
+        z = torch.randn(n_samples, self.latent_dim, device=self.device) * std_dev
         
-        # Get a sample of data
-        sample_indices = np.random.choice(len(self.sim_vals), n_samples, replace=False)
-        sample_data = self.sim_vals.iloc[sample_indices]
-        
-        # Encode to latent space
-        z_mean, z_log_var, z = self.encode(sample_data)
-        
-        # Create the plot
-        fig, ax = plt.subplots(figsize=figsize)
-        scatter = ax.scatter(
-            z_mean[:, dimensions[0]], 
-            z_mean[:, dimensions[1]], 
-            alpha=0.7, 
-            s=30
-        )
-        
-        # Add axis labels
-        ax.set_title('Latent Space Visualization')
-        ax.set_xlabel(f'Latent Dimension {dimensions[0]}')
-        ax.set_ylabel(f'Latent Dimension {dimensions[1]}')
-        ax.grid(True, linestyle='--', alpha=0.7)
-        
-        # Add uncertainty ellipses for a subset of points
-        if n_samples > 50:
-            subset_size = min(50, n_samples)
-            subset_indices = np.random.choice(n_samples, subset_size, replace=False)
-            
-            for idx in subset_indices:
-                # Get latent mean and variance for this point
-                center = z_mean[idx, dimensions]
-                # Convert log variance to standard deviation
-                std = np.exp(0.5 * z_log_var[idx, dimensions])
-                
-                # Create an ellipse to represent uncertainty
-                ellipse = plt.matplotlib.patches.Ellipse(
-                    xy=center,
-                    width=std[0]*2, height=std[1]*2,
-                    alpha=0.2, color='red'
-                )
-                ax.add_patch(ellipse)
-        
-        self.logger.statement("Plotting latent space dimensions "
-                             f"{dimensions[0]} vs {dimensions[1]}")
-        return fig
+        # Decode sampled latent vectors
+        return self.decode(z)
