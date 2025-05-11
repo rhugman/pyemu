@@ -1,14 +1,26 @@
 """
 Learning-based pattern-data-driven forecast approach (LDFA) emulator implementation.
+
+Note: This module requires TensorFlow. Install with:
+    pip install pyemu[emulators-ldfa] or pip install tensorflow
 """
 from __future__ import print_function, division
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import PCA
+
+# Import tensorflow lazily to allow importing this module even if tf is not installed
+# The actual import will occur when the LDFA class is instantiated
+def _import_tensorflow():
+    try:
+        import tensorflow as tf
+        return tf
+    except ImportError:
+        raise ImportError(
+            "The LDFA emulator requires TensorFlow, which is not installed. "
+            "Install it with 'pip install pyemu[emulators-ldfa]' or 'pip install tensorflow'."
+        )
 
 from .base import Emulator
 from .transformers import RowWiseMinMaxScaler
@@ -81,6 +93,15 @@ class LDFA(Emulator):
         verbose : bool, optional
             If True, enable verbose logging. Default is True.
         """
+        # Import tensorflow here to avoid import error if not installed
+        # This will raise a helpful error message if tensorflow is not available
+        self.tf = _import_tensorflow()
+        
+        # Make Keras components available as attributes
+        self.layers = self.tf.keras.layers
+        self.models = self.tf.keras.models
+        self.EarlyStopping = self.tf.keras.callbacks.EarlyStopping
+        
         super().__init__(verbose=verbose)
 
         self.seed = seed
@@ -98,7 +119,7 @@ class LDFA(Emulator):
         # Configure early stopping
         self.early_stop = None
         if early_stop:
-            self.early_stop = EarlyStopping(
+            self.early_stop = self.EarlyStopping(
                 monitor='val_loss', 
                 patience=20, 
                 restore_best_weights=True

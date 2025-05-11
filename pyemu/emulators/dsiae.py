@@ -1,14 +1,28 @@
 """
 Data Space Inversion AutoEncoder (DSIAE) emulator implementation.
+
+Note: This module requires TensorFlow. Install with:
+    pip install pyemu[emulators-dsiae] or pip install tensorflow
 """
 from __future__ import print_function, division
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-import tensorflow as tf
 import os
 import datetime
+
+# Import tensorflow lazily to allow importing this module even if tf is not installed
+# The actual import will occur when the DSIAE class is instantiated
+def _import_tensorflow():
+    try:
+        import tensorflow as tf
+        return tf
+    except ImportError:
+        raise ImportError(
+            "The DSIAE emulator requires TensorFlow, which is not installed. "
+            "Install it with 'pip install pyemu[emulators-dsiae]' or 'pip install tensorflow'."
+        )
 
 from .base import Emulator
 
@@ -138,6 +152,10 @@ class DSIAE(Emulator):
         verbose : bool, optional
             If True, enable verbose logging. Default is True.
         """
+        # Import tensorflow here to avoid import error if not installed
+        # This will raise a helpful error message if tensorflow is not available
+        self.tf = _import_tensorflow()
+        
         super().__init__(verbose=verbose)
         
         # Store input data

@@ -105,7 +105,14 @@ This installs: `matplotlib`, `pyshp`, `scipy`, `shapely`, `flopy`, `jinja2`, and
 ```
 pip install pyemu[emulators]
 ```
-This installs: `scikit-learn`, `tensorflow`, `matplotlib`, and `scipy`
+This installs: `scikit-learn`, `matplotlib`, and `scipy`
+
+**TensorFlow Emulators** (for DSIAE or LDFA emulators):
+```
+pip install pyemu[emulators-dsiae]  # For DSIAE emulator (adds TensorFlow)
+pip install pyemu[emulators-ldfa]   # For LDFA emulator (adds TensorFlow)
+pip install pyemu[emulators-all]    # For all TensorFlow-based emulators
+```
 
 **All dependencies** (for development or comprehensive usage):
 ```

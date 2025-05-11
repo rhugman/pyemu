@@ -41,9 +41,20 @@ optional = [
 ]
 emulators = [
     "scikit-learn",
-    "tensorflow",
     "matplotlib",
     "scipy",
+]
+emulators-dsiae = [
+    "tensorflow>=2.0.0",
+    "pyemu[emulators]",
+]
+emulators-ldfa = [
+    "tensorflow>=2.0.0",
+    "pyemu[emulators]",
+]
+emulators-all = [
+    "pyemu[emulators-dsiae]",
+    "pyemu[emulators-ldfa]",
 ]
 test = [
     "coveralls",
