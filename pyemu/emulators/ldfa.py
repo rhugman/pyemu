@@ -278,10 +278,10 @@ class LDFA(Emulator):
         
         # Set seed for reproducibility
         if self.seed is not None:
-            tf.keras.utils.set_random_seed(self.seed)
+            self.tf.keras.utils.set_random_seed(self.seed)
             
         # Create the model architecture
-        inputs = tf.keras.Input(shape=(input_dim,))
+        inputs = self.tf.keras.Input(shape=(input_dim,))
         x = inputs
         
         # Add hidden layers
@@ -289,19 +289,19 @@ class LDFA(Emulator):
             hidden_units = [2 * input_dim]
             
         for units in hidden_units:
-            x = layers.Dense(units, activation=activation)(x)
-            x = layers.Dropout(rate=dropout_rate)(x)
+            x = self.layers.Dense(units, activation=activation)(x)
+            x = self.layers.Dropout(rate=dropout_rate)(x)
 
         # Output layer
-        outputs = layers.Dense(output_dim)(x)
+        outputs = self.layers.Dense(output_dim)(x)
         
         # Define loss function
         loss_fn = 'mean_squared_error'
         
         # Create and compile the model
-        model = models.Model(inputs=inputs, outputs=outputs)
+        model = self.models.Model(inputs=inputs, outputs=outputs)
         model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=params['learning_rate']),
+            optimizer=self.tf.keras.optimizers.Adam(learning_rate=params['learning_rate']),
             loss=loss_fn,
             metrics=['mae', 'accuracy']
         )
