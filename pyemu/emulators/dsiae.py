@@ -1,5 +1,8 @@
 """
 Data Space Inversion AutoEncoder (DSIAE) emulator implementation.
+
+Note: This module requires TensorFlow. Install with:
+    pip install pyemu[emulators-dsiae] or pip install tensorflow
 """
 from __future__ import print_function, division
 import numpy as np
