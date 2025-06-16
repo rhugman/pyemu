@@ -55,7 +55,7 @@ class Encoder(nn.Module):
         # Build the scalar branch
         if 'scalar' in input_shapes and input_shapes['scalar'][0] > 0:
             scalar_input_dim = input_shapes['scalar'][0]
-            self.scalar_dim = max(32, min(128, scalar_input_dim * 2))
+            self.scalar_dim = min(128, scalar_input_dim * 2)
             
             self.scalar_net = nn.Sequential(
                 nn.Linear(scalar_input_dim, 64),
@@ -64,36 +64,29 @@ class Encoder(nn.Module):
                 nn.LeakyReLU(0.2),
             )
         
-        # Build time series branches if needed
+        # Build time series branches using LSTMs instead of CNNs
         if 'timeseries' in input_shapes and input_shapes['timeseries']:
             for i, shape in enumerate(input_shapes['timeseries']):
                 seq_len, features = shape
+                hidden_dim = (2*features)//1  # Output dimension for each time series
                 
-                # For short sequences, use simple networks
-                if seq_len <= 10:
-                    ts_net = nn.Sequential(
-                        nn.Linear(seq_len * features, 64),
-                        nn.LeakyReLU(0.2),
-                        nn.Linear(64, 32),
-                        nn.LeakyReLU(0.2)
-                    )
-                # For longer sequences, use 1D CNNs
-                else:
-                    ts_net = nn.Sequential(
-                        nn.Conv1d(features, 32, kernel_size=3, stride=1, padding=1),
-                        nn.LeakyReLU(0.2),
-                        nn.MaxPool1d(2),
-                        nn.Conv1d(32, 64, kernel_size=3, stride=1, padding=1),
-                        nn.LeakyReLU(0.2),
-                        nn.MaxPool1d(2),
-                        nn.Flatten(),
-                        nn.Linear(64 * (seq_len // 4), 32),
-                        nn.LeakyReLU(0.2)
-                    )
-                    
+                # Use bidirectional LSTM that can handle any sequence length
+                lstm = nn.LSTM(
+                    input_size=features, 
+                    hidden_size=hidden_dim, 
+                    num_layers=3,
+                    batch_first=True,
+                    bidirectional=True,
+                    dropout=0.1
+                )
+                
+                # Create adapter to extract features from LSTM output
+                adapter = LSTMOutputAdapter(hidden_dim * 2)  # *2 for bidirectional
+                
+                ts_net = nn.ModuleList([lstm, adapter])
                 self.timeseries_nets.append(ts_net)
-                self.timeseries_dim += 32  # Add output dimension for each TS branch
-        
+                self.timeseries_dim += hidden_dim * 2  # *2 for bidirectional LSTM
+         
         # Build spatial branches if needed
         if 'spatial' in input_shapes and input_shapes['spatial']:
             for i, shape in enumerate(input_shapes['spatial']):
@@ -188,17 +181,16 @@ class Encoder(nn.Module):
             features.append(scalar_features)
             input_idx += 1
         
-        # Process time series inputs
+        # Process time series inputs with LSTM
         if self.timeseries_nets is not None:
             for i, ts_net in enumerate(self.timeseries_nets):
-                ts_input = inputs[input_idx]
-                # Reshape if using 1D CNNs
-                if isinstance(ts_net[0], nn.Conv1d):
-                    # Input shape should be [batch, features, seq_len]
-                    if ts_input.shape[2] == 1:  # Check if shape is [batch, seq_len, features=1]
-                        # For single-feature time series, transpose to [batch, features, seq_len]
-                        ts_input = ts_input.transpose(1, 2)
-                ts_features = ts_net(ts_input)
+                ts_input = inputs[input_idx]  # Already in shape [batch, seq_len, features]
+                
+                # Process through LSTM and adapter
+                lstm, adapter = ts_net
+                output, (h_n, c_n) = lstm(ts_input)
+                ts_features = adapter(output, h_n)
+                
                 features.append(ts_features)
                 input_idx += 1
         
@@ -276,34 +268,32 @@ class Decoder(nn.Module):
                 nn.Linear(64, scalar_output_dim)
             )
         
-        # Time series branches
+        # Time series branches using LSTMs
         if 'timeseries' in output_shapes and output_shapes['timeseries']:
             for i, shape in enumerate(output_shapes['timeseries']):
                 seq_len, features = shape
+                hidden_dim = (2*features)//1  # Output dimension for each time series
                 
-                # For short sequences, use simple networks
-                if seq_len <= 10:
-                    ts_net = nn.Sequential(
-                        nn.Linear(64, 64),
-                        nn.LeakyReLU(0.2),
-                        nn.Linear(64, seq_len * features)
-                    )
-                # For longer sequences, use transposed convolutions
-                else:
-                    # Calculate intermediate dimensions
-                    first_layer_size = seq_len // 4
+                # Sequential network for time series generation
+                ts_net = nn.Sequential(
+                    # First expand latent to features for each timestep
+                    nn.Linear(64, hidden_dim * seq_len),
+                    nn.LeakyReLU(0.2),
+                    TimeSeriesReshaper(seq_len, hidden_dim),
                     
-                    ts_net = nn.Sequential(
-                        nn.Linear(64, 64 * first_layer_size),
-                        nn.LeakyReLU(0.2),
-                        nn.Unflatten(1, (64, first_layer_size)),
-                        nn.Upsample(scale_factor=2),
-                        nn.Conv1d(64, 32, kernel_size=3, padding=1),
-                        nn.LeakyReLU(0.2),
-                        nn.Upsample(scale_factor=2),
-                        nn.Conv1d(32, features, kernel_size=3, padding=1)
-                    )
+                    # Then use LSTM to generate the output sequence
+                    nn.LSTM(
+                        input_size=hidden_dim,
+                        hidden_size=hidden_dim,
+                        num_layers=3,
+                        batch_first=True,
+                        dropout=0.1
+                    ),
                     
+                    # Final projection to target dimensions
+                    TimeSeriesOutputProjector(hidden_dim, features, seq_len)
+                )
+                
                 self.timeseries_nets.append(ts_net)
                 
         # Spatial branches
@@ -363,22 +353,11 @@ class Decoder(nn.Module):
             scalar_output = self.scalar_net(x)
             outputs.append(scalar_output)
         
-        # Decode time series outputs
+        # Decode time series outputs with LSTM
         if self.timeseries_nets is not None:
             for i, ts_net in enumerate(self.timeseries_nets):
+                # Process through the sequential model
                 ts_output = ts_net(x)
-                
-                # For Conv1d-based decoders, output shape is [batch, features, seq_len]
-                seq_len, features = self.output_shapes['timeseries'][i]
-                
-                # Reshape output based on architecture
-                if len(ts_output.shape) == 3:  # [batch, features, seq_len] from Conv1d
-                    # Ensure output is properly shaped as [batch, seq_len, features]
-                    ts_output = ts_output.transpose(1, 2)
-                else:
-                    # For MLP-based networks, reshape from flattened form to [batch, seq_len, features]
-                    ts_output = ts_output.view(-1, seq_len, features)
-                    
                 outputs.append(ts_output)
         
         # Decode spatial outputs
@@ -517,6 +496,12 @@ class DSIAE(Emulator):
         If True, enable verbose logging. Default is True.
     device : str, optional
         Device to use for training. Default is 'auto', which will use GPU if available.
+    transforms : list of dict, optional
+        List of transformations to apply to the data before encoding/decoding. Each dict should have:
+        - 'type': str - Type of transformation (e.g., 'log10', 'normal_score')
+        - 'columns': list - Columns to apply the transformation to (optional)
+        - Additional kwargs specific to the transformer
+        If None, no transformations are applied.
     """
 
     def __init__(self, 
@@ -528,7 +513,8 @@ class DSIAE(Emulator):
                 latent_dim=8, 
                 learning_rate=0.001, 
                 verbose=True,
-                device='auto'):
+                device='auto',
+                transforms=None):
         """
         Initialize the DSIAE emulator.
 
@@ -553,6 +539,12 @@ class DSIAE(Emulator):
             If True, enable verbose logging. Default is True.
         device : str, optional
             Device to use for training. Default is 'auto', which will use GPU if available.
+        transforms : list of dict, optional
+            List of transformations to apply to the data before encoding/decoding. Each dict should have:
+            - 'type': str - Type of transformation (e.g., 'log10', 'normal_score')
+            - 'columns': list - Columns to apply the transformation to (optional)
+            - Additional kwargs specific to the transformer
+            If None, no transformations are applied.
         """
         super().__init__(verbose=verbose)
         
@@ -576,6 +568,9 @@ class DSIAE(Emulator):
         # Model parameters
         self.latent_dim = latent_dim
         self.learning_rate = learning_rate
+        
+        # Data transformations configuration
+        self.transforms = transforms or []
         
         # Select device (CPU or GPU)
         if device == 'auto':
@@ -667,14 +662,48 @@ class DSIAE(Emulator):
             
             # Note: KDTree is created only when needed for prediction, not here
         
-        # Compute mean observation vector
-        self.obs_vec = sim_obs_filtered.mean()
+        # Apply transformations if configured
+        if self.transforms:
+            self.logger.statement("Applying data transformations using AutobotsAssemble")
+            
+            # Import AutobotsAssemble here to avoid circular imports
+            from .transformers import AutobotsAssemble
+            
+            # Create an AutobotsAssemble instance with the filtered data
+            transformer = AutobotsAssemble(sim_obs_filtered)
+            
+            # Apply the configured transformations
+            for transform in self.transforms:
+                transform_type = transform.get('type')
+                columns = transform.get('columns')
+                
+                # Extract transformer-specific kwargs
+                kwargs = {k: v for k, v in transform.items() 
+                         if k not in ('type', 'columns')}
+                
+                self.logger.statement(f"Applying {transform_type} transformation")
+                transformer.apply(transform_type, columns=columns, **kwargs)
+            
+            # Store the transformer for inverse operations later
+            self.feature_transformer = transformer
+            
+            # Get the transformed data
+            sim_obs_transformed = transformer.df.copy()
+            
+            self.logger.statement("Transformations applied successfully")
+        else:
+            # No transformations applied
+            sim_obs_transformed = sim_obs_filtered.copy()
+            self.feature_transformer = None
+        
+        # Compute mean observation vector from transformed data
+        self.obs_vec = sim_obs_transformed.mean()
         
         # Center observation data
-        obs_centered = sim_obs_filtered - self.obs_vec.values
+        obs_centered = sim_obs_transformed - self.obs_vec.values
         
         # Store transformed data
-        self.sim_vals = sim_obs_filtered
+        self.sim_vals = sim_obs_transformed
         
         # Organize data by type
         self.organized_obs = self._organize_data_types(obs_centered)
@@ -1045,8 +1074,8 @@ class DSIAE(Emulator):
         neighbor_obs = self.sim_obs.iloc[indices]
         
         # Encode to latent space and decode to get predictions
-        latent_vectors = self.encode(neighbor_obs)
-        predictions = self.decode(latent_vectors)
+        latent_mean,latent_logvar,latent_sample= self.encode(neighbor_obs)
+        predictions = self.decode(latent_sample)
         
         return predictions
 
@@ -1312,12 +1341,20 @@ class DSIAE(Emulator):
         missing = [col for col in self.obs_names if col not in obs_data.columns]
         if missing:
             raise ValueError(f"Missing columns in observation data: {missing}")
-            
+        
+        # Apply transformations if configured using the feature_transformer
+        if hasattr(self, 'feature_transformer') and self.feature_transformer is not None:
+            self.logger.statement("Applying transformations before encoding")
+            # Use the transformer to transform the input data but only for the columns we need
+            transformed_obs = self.feature_transformer.transform(obs_data[self.obs_names])
+        else:
+            transformed_obs = obs_data[self.obs_names].copy()
+        
         # Center data using the training mean
         if self.obs_vec is None:
             raise ValueError("Mean observation vector is not available. Train the model first.")
             
-        obs_centered = obs_data[self.obs_names] - self.obs_vec.values
+        obs_centered = transformed_obs - self.obs_vec.values
         
         # Organize data types
         organized_data = self._organize_data_types(obs_centered)
@@ -1328,13 +1365,13 @@ class DSIAE(Emulator):
         # Set model to evaluation mode
         self.vae.eval()
         self.encoder.eval()
-        print(tensor_inputs[0].shape)
+        
         # Encode to latent space
         with torch.no_grad():
             z_mean, z_log_var, z = self.encoder(tensor_inputs)
             
         # Return as numpy array
-        return z.cpu().numpy()
+        return z_mean.cpu().numpy(), z_log_var.cpu().numpy(), z.cpu().numpy()
         
     def decode(self, latent_vectors):
         """
@@ -1455,6 +1492,12 @@ class DSIAE(Emulator):
         # Un-center data using the training mean
         result += self.obs_vec.values
         
+        # Apply inverse transformations if configured
+        if hasattr(self, 'feature_transformer') and self.feature_transformer is not None:
+            self.logger.statement("Applying inverse transformations after decoding")
+            # Use the transformer to inverse transform the result
+            result = self.feature_transformer.inverse_on_external_df(result)
+            
         return result
     
     def generate(self, n_samples=1, std_dev=1.0):
@@ -1482,3 +1525,415 @@ class DSIAE(Emulator):
         
         # Decode sampled latent vectors
         return self.decode(z)
+    
+    def configure_transformers(self, transforms):
+        """
+        Configure data transformation options for the emulator after initialization.
+        
+        This method allows updating transformation options without recreating the emulator,
+        which is useful when you need to modify transformation settings for different scenarios.
+        
+        Parameters
+        ----------
+        transforms : list of dict
+            List of transformations to apply to the data. Each dictionary should have:
+            - 'type': str - Type of transformation (e.g., 'log10', 'normal_score')
+            - 'columns': list - Columns to apply the transformation to (optional)
+            - Additional kwargs specific to the transformer
+            
+        Returns
+        -------
+        self : DSIAE
+            Returns self for method chaining.
+        """
+        self.transforms = transforms
+        
+        # If we already have data, reapply the transformations
+        if self.sim_obs is not None:
+            self.prepare_data(self.sim_obs, self.pars, self.obs_names, self.par_names)
+            
+            # Need to rebuild the model if it was already built
+            if self.fitted:
+                self._build_model()
+                self.logger.statement("Model rebuilt to accommodate new transformations")
+            
+        return self
+
+
+
+
+
+
+
+
+
+    import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+# Custom LSTM helper classes
+class LSTMOutputAdapter(nn.Module):
+    """Helper module to process LSTM outputs for encoder"""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+    
+    def forward(self, output, hidden):
+        # Use the final time step output for each sequence
+        return output[:, -1, :]
+
+class TimeSeriesReshaper(nn.Module):
+    """Reshape flat tensor to sequence for LSTM input"""
+    def __init__(self, seq_len, hidden_dim):
+        super().__init__()
+        self.seq_len = seq_len
+        self.hidden_dim = hidden_dim
+    
+    def forward(self, x):
+        # Reshape from [batch, seq_len*hidden] to [batch, seq_len, hidden]
+        return x.view(-1, self.seq_len, self.hidden_dim)
+
+class TimeSeriesOutputProjector(nn.Module):
+    """Project LSTM output to target sequence dimension"""
+    def __init__(self, hidden_dim, out_features, seq_len):
+        super().__init__()
+        self.proj = nn.Linear(hidden_dim, out_features)
+        self.seq_len = seq_len
+        self.out_features = out_features
+    
+    def forward(self, lstm_output):
+        # lstm_output is tuple of (outputs, (h_n, c_n))
+        # Get outputs which is [batch, seq_len, hidden]
+        # Project to target feature dimension
+        return self.proj(lstm_output[0])  # Shape: [batch, seq_len, out_features]
+# Define LSTM-based Encoder to replace CNN encoder
+class EncoderWithLSTM(nn.Module):
+    """Encoder component that uses LSTM for time series data."""
+    def __init__(self, input_shapes, latent_dim=8):
+        super().__init__()
+        
+        self.input_shapes = input_shapes
+        self.latent_dim = latent_dim
+        
+        # Branch processing networks
+        self.scalar_net = None
+        self.timeseries_nets = nn.ModuleList() if 'timeseries' in input_shapes else None
+        self.spatial_nets = nn.ModuleList() if 'spatial' in input_shapes else None
+        
+        # Dimensions for each branch output
+        self.scalar_dim = 0
+        self.timeseries_dim = 0
+        self.spatial_dim = 0
+        
+        # Build the scalar branch (unchanged)
+        if 'scalar' in input_shapes and input_shapes['scalar'][0] > 0:
+            scalar_input_dim = input_shapes['scalar'][0]
+            self.scalar_dim = max(32, min(128, scalar_input_dim * 2))
+            
+            self.scalar_net = nn.Sequential(
+                nn.Linear(scalar_input_dim, 64),
+                nn.LeakyReLU(0.2),
+                nn.Linear(64, self.scalar_dim),
+                nn.LeakyReLU(0.2),
+            )
+        
+        # Build time series branches using LSTMs instead of CNNs
+        if 'timeseries' in input_shapes and input_shapes['timeseries']:
+            for i, shape in enumerate(input_shapes['timeseries']):
+                seq_len, features = shape
+                hidden_dim = 32  # Output dimension for each time series
+                
+                # Use bidirectional LSTM that can handle any sequence length
+                lstm = nn.LSTM(
+                    input_size=features, 
+                    hidden_size=hidden_dim, 
+                    num_layers=2,
+                    batch_first=True,
+                    bidirectional=True,
+                    dropout=0.1
+                )
+                
+                # Create adapter to extract features from LSTM output
+                adapter = LSTMOutputAdapter(hidden_dim * 2)  # *2 for bidirectional
+                
+                ts_net = nn.ModuleList([lstm, adapter])
+                self.timeseries_nets.append(ts_net)
+                self.timeseries_dim += hidden_dim * 2  # *2 for bidirectional LSTM
+        
+        # Build spatial branches (unchanged)
+        if 'spatial' in input_shapes and input_shapes['spatial']:
+            for i, shape in enumerate(input_shapes['spatial']):
+                h, w, c = shape
+                
+                # For small images/grids, use simpler networks
+                if h * w <= 100:  
+                    spatial_net = nn.Sequential(
+                        nn.Flatten(),
+                        nn.Linear(h * w * c, 64),
+                        nn.LeakyReLU(0.2),
+                        nn.Linear(64, 32),
+                        nn.LeakyReLU(0.2)
+                    )
+                else:
+                    spatial_net = nn.Sequential(
+                        nn.Conv2d(c, 16, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.MaxPool2d(2),
+                        nn.Conv2d(16, 32, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.MaxPool2d(2),
+                        nn.Flatten(),
+                        nn.Linear(32 * (h // 4) * (w // 4), 32),
+                        nn.LeakyReLU(0.2)
+                    )
+                    
+                self.spatial_nets.append(spatial_net)
+                self.spatial_dim += 32
+        
+        # Calculate total feature dimension after all branches
+        self.total_features = self.scalar_dim + self.timeseries_dim + self.spatial_dim
+        
+        # Feature fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(self.total_features, 64),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # VAE bottleneck outputs
+        self.z_mean = nn.Linear(64, latent_dim)
+        self.z_log_var = nn.Linear(64, latent_dim)
+    
+    def reparameterize(self, z_mean, z_log_var):
+        """Reparameterization trick (unchanged)"""
+        std = torch.exp(0.5 * z_log_var)
+        eps = torch.randn_like(std)
+        z = z_mean + eps * std
+        return z
+    
+    def forward(self, inputs):
+        """Forward pass through the encoder"""
+        features = []
+        input_idx = 0
+        
+        # Process scalar inputs (unchanged)
+        if self.scalar_net is not None:
+            scalar_features = self.scalar_net(inputs[input_idx])
+            features.append(scalar_features)
+            input_idx += 1
+        
+        # Process time series inputs with LSTM
+        if self.timeseries_nets is not None:
+            for i, ts_net in enumerate(self.timeseries_nets):
+                ts_input = inputs[input_idx]  # Already in shape [batch, seq_len, features]
+                
+                # Process through LSTM and adapter
+                lstm, adapter = ts_net
+                output, (h_n, c_n) = lstm(ts_input)
+                ts_features = adapter(output, h_n)
+                
+                features.append(ts_features)
+                input_idx += 1
+        
+        # Process spatial inputs (unchanged)
+        if self.spatial_nets is not None:
+            for i, spatial_net in enumerate(self.spatial_nets):
+                spatial_input = inputs[input_idx]
+                # Reshape if using 2D CNNs
+                if isinstance(spatial_net[0], nn.Conv2d):
+                    # Input shape should be [batch, channels, height, width]
+                    spatial_input = spatial_input.permute(0, 3, 1, 2)
+                spatial_features = spatial_net(spatial_input)
+                features.append(spatial_features)
+                input_idx += 1
+        
+        # Concatenate all features
+        x = torch.cat(features, dim=1)
+        
+        # Apply fusion layer
+        x = self.fusion(x)
+        
+        # VAE outputs
+        z_mean = self.z_mean(x)
+        z_log_var = self.z_log_var(x)
+        z = self.reparameterize(z_mean, z_log_var)
+        
+        return z_mean, z_log_var, z
+# Define LSTM-based Decoder to replace CNN decoder
+class DecoderWithLSTM(nn.Module):
+    """Decoder component that uses LSTM for time series data."""
+    def __init__(self, latent_dim, output_shapes):
+        super().__init__()
+        
+        self.latent_dim = latent_dim
+        self.output_shapes = output_shapes
+        
+        # Latent to hidden expansion (unchanged)
+        self.latent_expansion = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # Branch processors
+        self.scalar_net = None
+        self.timeseries_nets = nn.ModuleList() if 'timeseries' in output_shapes else None
+        self.spatial_nets = nn.ModuleList() if 'spatial' in output_shapes else None
+        
+        # Scalar branch (unchanged)
+        if 'scalar' in output_shapes and output_shapes['scalar'][0] > 0:
+            scalar_output_dim = output_shapes['scalar'][0]
+            self.scalar_net = nn.Sequential(
+                nn.Linear(64, 64),
+                nn.LeakyReLU(0.2),
+                nn.Linear(64, scalar_output_dim)
+            )
+        
+        # Time series branches using LSTMs
+        if 'timeseries' in output_shapes and output_shapes['timeseries']:
+            for i, shape in enumerate(output_shapes['timeseries']):
+                seq_len, features = shape
+                hidden_dim = 32
+                
+                # Sequential network for time series generation
+                ts_net = nn.Sequential(
+                    # First expand latent to features for each timestep
+                    nn.Linear(64, hidden_dim * seq_len),
+                    nn.LeakyReLU(0.2),
+                    TimeSeriesReshaper(seq_len, hidden_dim),
+                    
+                    # Then use LSTM to generate the output sequence
+                    nn.LSTM(
+                        input_size=hidden_dim,
+                        hidden_size=hidden_dim,
+                        num_layers=2,
+                        batch_first=True,
+                        dropout=0.1
+                    ),
+                    
+                    # Final projection to target dimensions
+                    TimeSeriesOutputProjector(hidden_dim, features, seq_len)
+                )
+                
+                self.timeseries_nets.append(ts_net)
+        
+        # Spatial branches (unchanged)
+        if 'spatial' in output_shapes and output_shapes['spatial']:
+            for i, shape in enumerate(output_shapes['spatial']):
+                h, w, c = shape
+                
+                # For small images/grids, use simpler networks
+                if h * w <= 100:  # e.g., 10x10 or smaller
+                    spatial_net = nn.Sequential(
+                        nn.Linear(64, 64),
+                        nn.LeakyReLU(0.2),
+                        nn.Linear(64, h * w * c)
+                    )
+                # For larger spatial data, use transposed convolutions
+                else:
+                    # Calculate intermediate dimensions
+                    h_small = h // 4
+                    w_small = w // 4
+                    
+                    spatial_net = nn.Sequential(
+                        nn.Linear(64, 32 * h_small * w_small),
+                        nn.LeakyReLU(0.2),
+                        nn.Unflatten(1, (32, h_small, w_small)),
+                        nn.Upsample(scale_factor=2),
+                        nn.Conv2d(32, 16, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.2),
+                        nn.Upsample(scale_factor=2),
+                        nn.Conv2d(16, c, kernel_size=3, padding=1)
+                    )
+                    
+                self.spatial_nets.append(spatial_net)
+                
+    def forward(self, z):
+        """Forward pass through the decoder"""
+        # Expand latent vector to hidden representation
+        x = self.latent_expansion(z)
+        
+        outputs = []
+        
+        # Decode scalar outputs (unchanged)
+        if self.scalar_net is not None:
+            scalar_output = self.scalar_net(x)
+            outputs.append(scalar_output)
+        
+        # Decode time series outputs with LSTM
+        if self.timeseries_nets is not None:
+            for i, ts_net in enumerate(self.timeseries_nets):
+                # Process through the sequential model
+                ts_output = ts_net(x)
+                outputs.append(ts_output)
+        
+        # Decode spatial outputs (unchanged)
+        if self.spatial_nets is not None:
+            for i, spatial_net in enumerate(self.spatial_nets):
+                spatial_output = spatial_net(x)
+                
+                # Reshape output if using transposed convolutions
+                if len(spatial_output.shape) == 4:  # [batch, channels, height, width]
+                    # Change to [batch, height, width, channels]
+                    spatial_output = spatial_output.permute(0, 2, 3, 1)
+                else:
+                    # Reshape to [batch, height, width, channels]
+                    h, w, c = self.output_shapes['spatial'][i]
+                    spatial_output = spatial_output.view(-1, h, w, c)
+                    
+                outputs.append(spatial_output)
+        
+        return outputs
+# Create a full VAE with the LSTM-based encoder and decoder
+class VariationalAutoEncoderWithLSTM(nn.Module):
+    """Variational Autoencoder with LSTM for time series data."""
+    def __init__(self, input_shapes, output_shapes, latent_dim=8):
+        super().__init__()
+        
+        self.encoder = EncoderWithLSTM(input_shapes, latent_dim)
+        self.decoder = DecoderWithLSTM(latent_dim, output_shapes)
+        
+    def forward(self, inputs):
+        """Forward pass through the complete autoencoder"""
+        # Encode inputs to latent space
+        z_mean, z_log_var, z = self.encoder(inputs)
+        
+        # Decode latent vectors to outputs
+        outputs = self.decoder(z)
+        
+        return outputs, z_mean, z_log_var, z
+    
+
+# Custom DSIAE class that uses LSTM for time series
+class DSIAE_LSTM(DSIAE):
+    """DSIAE emulator that uses recurrent neural networks for time series data."""
+    
+    def _build_model(self):
+        """Override _build_model to use LSTM-based architecture"""
+        if self.organized_obs is None:
+            raise ValueError("No organized observation data available. Call prepare_data first.")
+            
+        # Get input and output shapes from organized data
+        input_shapes = self.organized_obs['input_shapes']
+        output_shapes = self.organized_obs['output_shapes']
+        
+        # Create encoder and decoder with LSTM components
+        self.logger.statement(f"Building LSTM encoder with latent dim {self.latent_dim}")
+        self.encoder = EncoderWithLSTM(input_shapes, latent_dim=self.latent_dim)
+        
+        self.logger.statement("Building LSTM decoder")
+        self.decoder = DecoderWithLSTM(self.latent_dim, output_shapes)
+        
+        # Create complete VAE model
+        self.vae = VariationalAutoEncoderWithLSTM(input_shapes, output_shapes, latent_dim=self.latent_dim)
+        
+        # Move models to the specified device
+        self.encoder.to(self.device)
+        self.decoder.to(self.device)
+        self.vae.to(self.device)
+        
+        # Set up optimizer
+        self.optimizer = optim.Adam(self.vae.parameters(), lr=self.learning_rate)
+        
+        self.logger.statement("LSTM-based model built successfully")
+        return
