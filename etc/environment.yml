@@ -8,7 +8,6 @@ dependencies:
   - numpy
   - pandas
   # optional
-  - tensorflow
   - matplotlib
   - pyshp
   - jinja2
