@@ -438,7 +438,7 @@ class EnDS(object):
 
     def get_parameter_importance_convergence_summary(self, num_realization_sequence,
                                                       num_replicate_sequence, parlist_dict=None,
-                                                      eigthresh=1.0e-5):
+                                                      eigthresh=1.0e-5, noise_cov=None):
         """repeatedly run `EnDS.get_parameter_importance_moments()` with less than all the
         possible realizations to evaluate whether the importance (uncertainty) estimates
         have converged with respect to ensemble size.  The parameter-conditioning analog
@@ -452,6 +452,8 @@ class EnDS(object):
                 to pass to `EnDS.get_parameter_importance_moments()`.
             eigthresh (`float`): truncation ratio for the truncated-SVD pseudo-inverse of
                 each parameter data block.  Default is 1.0e-5
+            noise_cov (`float`, `pyemu.Cov` or `str`, optional): regularization passed to
+                `EnDS.get_parameter_importance_moments()`.  Default is `None` (exact).
 
         Returns:
             `dict`: a dictionary of num_reals: `pd.DataFrame` pairs, where the dataframe is
@@ -492,7 +494,7 @@ class EnDS(object):
                 sim_sub = sim_df.loc[rreals].copy()
                 _, dfstd, _ = self.get_parameter_importance_moments(
                     parlist_dict=parlist_dict, par_ensemble=par_sub, sim_ensemble=sim_sub,
-                    include_first_moment=False, eigthresh=eigthresh)
+                    include_first_moment=False, eigthresh=eigthresh, noise_cov=noise_cov)
                 rep_results.append(dfstd)
             results[nreals] = rep_results
 
@@ -600,8 +602,11 @@ class EnDS(object):
             cond_dict (`dict`): {group_name: [conditioning names]} mapping.
             predictions (`[str]`): prediction names (columns of `data_df`) whose
                 posterior moments are reported.
-            noise_cov (`pyemu.Cov`, optional): covariance added to each conditioning
-                data block (e.g. observation noise).  If `None`, conditioning is exact.
+            noise_cov (`pyemu.Cov` or `float`, optional): regularization/noise added to each
+                conditioning data block.  A `pyemu.Cov` is added directly (e.g. observation
+                noise or a prior parameter covariance).  A scalar is treated as relative
+                diagonal inflation - a fraction of each conditioning quantity's own variance
+                is added to the diagonal.  If `None`, conditioning is exact.
             include_first_moment (`bool`): whether to compute per-realization first moments.
             eigthresh (`float`): truncation ratio for the truncated-SVD pseudo-inverse
                 of each conditioning data block.  Keeps the computation robust to
@@ -639,7 +644,13 @@ class EnDS(object):
 
             if noise_cov is not None:
                 self.logger.log("adding noise cov to data block")
-                dd += noise_cov.get(cnames, cnames).x
+                if np.isscalar(noise_cov):
+                    # relative diagonal inflation: add a fraction of each conditioning
+                    # quantity's own variance (scale-free Tikhonov regularization)
+                    dd[np.diag_indices_from(dd)] += float(noise_cov) * np.diag(dd)
+                else:
+                    # an explicit (e.g. observation noise or prior) covariance block
+                    dd += noise_cov.get(cnames, cnames).x
                 self.logger.log("adding noise cov to data block")
 
             # truncated-SVD pseudo-inverse - robust to rank-deficient/collinear blocks
@@ -657,12 +668,15 @@ class EnDS(object):
                                    for real in data_df.index}
                 self.logger.log("preping first moment pieces")
 
+            neg_preds = []
             for i, p in enumerate(predictions):
                 self.logger.log("calc second moment for " + p)
                 ccov_vec = ccov[:, i]
                 first_term = np.dot(ccov_vec.transpose(), dd)
                 schur = np.dot(first_term, ccov_vec)
                 post_var = prior_var.iloc[i] - schur
+                if post_var < 0:
+                    neg_preds.append(p)
                 pt_var.append(post_var)
                 self.logger.log("calc second moment for " + p)
                 if include_first_moment:
@@ -674,6 +688,18 @@ class EnDS(object):
                         mean_vals.append(mn)
                     pt_mean[p] = np.array(mean_vals)
                     self.logger.log("calc first moment values for " + p)
+            if len(neg_preds) > 0:
+                # a negative posterior variance (-> NaN std) signals a rank-deficient
+                # or ill-conditioned conditioning block (group larger than the ensemble
+                # can resolve, or strongly collinear).  the resulting std/percent values
+                # will be NaN for these predictions.
+                self.logger.warn(
+                    "negative posterior variance for group '{0}' and prediction(s) {1}; "
+                    "the conditioning block is rank-deficient/ill-conditioned (group of {2} "
+                    "names vs {3} realizations) - consider more realizations, a larger "
+                    "eigthresh, or smaller/less-collinear groups".format(
+                        group, ",".join(neg_preds), len(cnames), nreal)
+                )
             if include_first_moment:
                 mean_df = pd.DataFrame(pt_mean, index=reals)
                 mean_dfs[group] = mean_df
@@ -691,7 +717,7 @@ class EnDS(object):
 
     def get_parameter_importance_moments(self, parlist_dict=None, par_ensemble=None,
                                          sim_ensemble=None, include_first_moment=False,
-                                         eigthresh=1.0e-5):
+                                         eigthresh=1.0e-5, noise_cov=None):
         """A parameter-importance method to analyze the posterior (expected) mean and
         uncertainty of the predictions as a result of conditioning on (i.e. coming to
         know) one or more parameters.  This is the same ensemble Schur math as
@@ -715,6 +741,13 @@ class EnDS(object):
                 the variance reduction, and the first moment is the slow path).
             eigthresh (`float`): truncation ratio for the truncated-SVD pseudo-inverse of
                 each parameter data block.  Default is 1.0e-5
+            noise_cov (`float`, `pyemu.Cov` or `str`, optional): regularization added to each
+                parameter data block before inversion (inexact conditioning).  A scalar is
+                relative diagonal inflation - a fraction of each parameter's own (log-space)
+                variance is added to the diagonal (e.g. `0.05` inflates by 5%).  A `pyemu.Cov`
+                (or a filename to load one from) is added directly and may carry parameter
+                correlation - it must be in the same (log) space as the ensemble; see
+                `pyemu.Cov.from_parameter_data`.  If `None` (default), conditioning is exact.
 
         Returns:
             tuple containing
@@ -729,7 +762,10 @@ class EnDS(object):
             the parameter data block.  Because an empirical covariance from `n`
             realizations has rank <= `n-1`, multi-parameter groups (e.g. the injected
             "all" group) are rank-deficient and are inverted with a truncated-SVD
-            pseudo-inverse controlled by `eigthresh`.
+            pseudo-inverse controlled by `eigthresh`.  A rank-deficient/ill-conditioned
+            block can yield a negative posterior variance (reported as NaN std); if that
+            happens, use more realizations, a larger `eigthresh`, smaller/less-collinear
+            groups, or supply `noise_cov` to regularize.
 
         Example::
 
@@ -748,6 +784,22 @@ class EnDS(object):
             )
         if sim_ensemble is None:
             sim_ensemble = self.sim_ensemble
+
+        # resolve the optional regularization: scalar (relative diagonal inflation) is
+        # passed through to the helper as-is; a Cov is used directly; a filename is loaded
+        if noise_cov is not None and not np.isscalar(noise_cov):
+            if isinstance(noise_cov, str):
+                noise_cov = self.__fromfile(noise_cov, astype=Cov)
+            elif not isinstance(noise_cov, Matrix):
+                raise Exception(
+                    "EnDS.get_parameter_importance_moments(): noise_cov must be a scalar, "
+                    "a pyemu.Cov/Matrix, or a filename - not " + str(type(noise_cov))
+                )
+        elif np.isscalar(noise_cov) and noise_cov < 0:
+            raise Exception(
+                "EnDS.get_parameter_importance_moments(): scalar noise_cov "
+                "(relative inflation) must be non-negative"
+            )
 
         par = self.pst.parameter_data
         adj_names = par.loc[~par.partrans.isin(["fixed", "tied"]), "parnme"].tolist()
@@ -817,8 +869,8 @@ class EnDS(object):
             )
         data_df = pd.concat([cond_df.loc[common], pred_df.loc[common]], axis=1)
 
-        # exact conditioning: no noise term added (noise_cov=None)
+        # exact conditioning by default (noise_cov is None); a scalar or Cov regularizes
         return self._conditioning_moments(data_df, parlist_dict, self.predictions,
-                                          noise_cov=None,
+                                          noise_cov=noise_cov,
                                           include_first_moment=include_first_moment,
                                           eigthresh=eigthresh)
