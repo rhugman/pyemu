@@ -745,9 +745,13 @@ class EnDS(object):
                 parameter data block before inversion (inexact conditioning).  A scalar is
                 relative diagonal inflation - a fraction of each parameter's own (log-space)
                 variance is added to the diagonal (e.g. `0.05` inflates by 5%).  A `pyemu.Cov`
-                (or a filename to load one from) is added directly and may carry parameter
-                correlation - it must be in the same (log) space as the ensemble; see
-                `pyemu.Cov.from_parameter_data`.  If `None` (default), conditioning is exact.
+                (or a filename to load one from) is added directly and must be in the same
+                (log) space as the ensemble.  To stabilize a rank-deficient block the term
+                must be full rank in the deficient directions: a diagonal prior
+                (`pyemu.Cov.from_parameter_data`, which is diagonal) or a full-rank correlated
+                prior (`pyemu.helpers.geostatistical_prior_builder`) both work; the ensemble's
+                own empirical covariance does NOT (it shares the block's null space).  If
+                `None` (default), conditioning is exact.
 
         Returns:
             tuple containing
@@ -779,11 +783,15 @@ class EnDS(object):
             # the quick, scale-free knob:
             _,dfstd,_ = ends.get_parameter_importance_moments(parlist_dict=parlist_dict,noise_cov=0.05)
 
-            # when the trouble is parameter *correlation* (pilot points, multipliers), a scaled
-            # prior covariance regularizes the off-diagonals too.  Cov.from_parameter_data is in
-            # the same log space as the (log-transformed) ensemble:
+            # or set the magnitude from the control file instead of the ensemble with a
+            # diagonal, bounds-based prior (Cov.from_parameter_data is diagonal and full rank,
+            # in the same log space as the log-transformed ensemble):
             reg = 0.1 * pyemu.Cov.from_parameter_data(ends.pst)   # 10% of the prior, as "noise"
             _,dfstd,_ = ends.get_parameter_importance_moments(parlist_dict=parlist_dict,noise_cov=reg)
+            # NB: do not use the ensemble's own empirical covariance as noise_cov - it shares the
+            # block's null space, so (dd + a*dd) stays singular and the overshoot is not fixed.
+            # for a *correlated* full-rank prior, build one with
+            # pyemu.helpers.geostatistical_prior_builder.
 
         """
         if par_ensemble is None:
