@@ -766,10 +766,12 @@ class EnDS(object):
             the parameter data block.  Because an empirical covariance from `n`
             realizations has rank <= `n-1`, multi-parameter groups (e.g. the injected
             "all" group) are rank-deficient and are inverted with a truncated-SVD
-            pseudo-inverse controlled by `eigthresh`.  A rank-deficient/ill-conditioned
-            block can yield a negative posterior variance (reported as NaN std); if that
-            happens, use more realizations, a larger `eigthresh`, smaller/less-collinear
-            groups, or supply `noise_cov` to regularize.
+            pseudo-inverse controlled by `eigthresh`.  Any conditioning group with at
+            least `n_real` members triggers a warning, since its importance is over-fit
+            (tends toward ~100% regardless of true worth); a rank-deficient block can also
+            yield a negative posterior variance (reported as NaN std).  If either happens,
+            use more realizations, a larger `eigthresh`, smaller/less-collinear groups, or
+            supply `noise_cov` to regularize.
 
         Example::
 
@@ -886,6 +888,24 @@ class EnDS(object):
                 "parameter/observation ensembles aligned on {0} shared realizations; "
                 "{1} realization(s) dropped".format(len(common), ndrop)
             )
+        nreal = len(common)
+
+        # proactively warn when a conditioning group has more parameters than the
+        # ensemble can resolve: an empirical covariance from nreal realizations has
+        # rank <= nreal-1, so a larger group is rank-deficient and its importance is
+        # over-fit (tends toward ~100% regardless of true worth), whether or not the
+        # posterior variance actually goes negative
+        oversized = {g: len(v) for g, v in parlist_dict.items() if len(v) >= nreal}
+        if len(oversized) > 0:
+            detail = ", ".join("{0}({1})".format(g, n)
+                               for g, n in sorted(oversized.items(), key=lambda kv: -kv[1]))
+            self.logger.warn(
+                "conditioning dimension exceeds the ensemble size (n_real={0}); these "
+                "group(s) are rank-deficient (rank <= {1}) and their parameter importance "
+                "may be over-fit/unreliable - reduce the group size below n_real or pass "
+                "noise_cov to regularize: {2}".format(nreal, nreal - 1, detail)
+            )
+
         data_df = pd.concat([cond_df.loc[common], pred_df.loc[common]], axis=1)
 
         # exact conditioning by default (noise_cov is None); a scalar or Cov regularizes
