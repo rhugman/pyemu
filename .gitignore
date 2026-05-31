@@ -7,6 +7,12 @@ __pycache__/
 .DS_Store
 *~
 
+# Claude Code
+.claude/
+CONTEXT.md
+CONTEXT-MAP.md
+docs/adr/
+
 # C extensions
 *.so
 
