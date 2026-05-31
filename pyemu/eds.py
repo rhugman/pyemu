@@ -774,6 +774,17 @@ class EnDS(object):
             parlist_dict = {"hk":["hk1","hk2"],"rch":["rch1","rch2"]}
             mean_dfs,dfstd,dfpercent = ends.get_parameter_importance_moments(parlist_dict=parlist_dict)
 
+            # if a large/collinear group overshoots (negative posterior variance -> NaN std),
+            # regularize.  a scalar inflates each parameter's variance by a fraction (here 5%) -
+            # the quick, scale-free knob:
+            _,dfstd,_ = ends.get_parameter_importance_moments(parlist_dict=parlist_dict,noise_cov=0.05)
+
+            # when the trouble is parameter *correlation* (pilot points, multipliers), a scaled
+            # prior covariance regularizes the off-diagonals too.  Cov.from_parameter_data is in
+            # the same log space as the (log-transformed) ensemble:
+            reg = 0.1 * pyemu.Cov.from_parameter_data(ends.pst)   # 10% of the prior, as "noise"
+            _,dfstd,_ = ends.get_parameter_importance_moments(parlist_dict=parlist_dict,noise_cov=reg)
+
         """
         if par_ensemble is None:
             par_ensemble = self.par_ensemble
