@@ -473,41 +473,22 @@ class GPR(Emulator):
 
     def _write_forward_run_script(self, filename, emu_file, input_file, output_file, class_name, pst_name=None):
         """Generates the python script that PEST++ runs for GPR (handles tuple return)."""
-        import inspect
         from pyemu.utils.helpers import gpr_file_forward_run, gpr_runstore_forward_run, gpr_forward_run
 
         use_runstor = getattr(self, "_use_runstor", False)
-        
-        target_func = "gpr_runstore_forward_run" if use_runstor else "gpr_file_forward_run"
         if use_runstor:
+            target_func = "gpr_runstore_forward_run"
             call_args = f"emu_file='{emu_file}'"
             if pst_name is not None:
                 call_args += f", pst_name='{pst_name}'"
         else:
+            target_func = "gpr_file_forward_run"
             call_args = f"'{emu_file}', '{input_file}', '{output_file}'"
 
-        lines = [
-            "import sys",
-            "import os",
-            "import pandas as pd",
-            "import numpy as np",
-            "import traceback",
-            "import pickle",
-            "",
-            "sys.path.append(os.getcwd())",
-            ""
-        ]
-
-        # Inject code for all use cases
-        for func in [gpr_forward_run, gpr_file_forward_run, gpr_runstore_forward_run]:
-             lines.append(f"# Source for {func.__name__}")
-             lines.append(inspect.getsource(func))
-             lines.append("")
-
-        lines.append('if __name__ == "__main__":')
-        lines.append(f'    {target_func}({call_args})')
-
-        with open(filename, 'w') as f:
-            for line in lines:
-                f.write(line + "\n")
+        self._write_forward_run_script_body(
+            filename,
+            [gpr_forward_run, gpr_file_forward_run, gpr_runstore_forward_run],
+            target_func,
+            call_args,
+        )
 

@@ -453,4 +453,32 @@ class Emulator:
            Subclasses must implement this method to handle specific return types and behaviors."""
         raise NotImplementedError("Subclasses must implement _write_forward_run_script")
 
+    def _write_forward_run_script_body(self, filename, funcs, target_func, call_args):
+        """Write a self-contained forward_run.py: embeds the source of each
+        function in `funcs` (via inspect.getsource) and calls
+        `target_func(call_args)` under __main__."""
+        import inspect
+
+        lines = [
+            "import sys",
+            "import os",
+            "import pandas as pd",
+            "import numpy as np",
+            "import traceback",
+            "import pickle",
+            "",
+            "sys.path.append(os.getcwd())",
+            ""
+        ]
+        for func in funcs:
+            lines.append(f"# Source for {func.__name__}")
+            lines.append(inspect.getsource(func))
+            lines.append("")
+        lines.append('if __name__ == "__main__":')
+        lines.append(f'    {target_func}({call_args})')
+
+        with open(filename, 'w') as f:
+            for line in lines:
+                f.write(line + "\n")
+
     #TODO: implment helper function that scrapes  directory and collates training data from Pst ensemble files + control file information.

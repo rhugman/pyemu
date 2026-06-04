@@ -1335,6 +1335,89 @@ class TestDSIFitPredict:
             assert log_tr.shifts[col] != 0
 
 
+class TestDSITransformValidation:
+    """Regression tests for the DSI.__init__ transform-spec validation.
+
+    The old `assert`-chain validation (stripped under `python -O`) was replaced
+    by Emulator._validate_transforms (shared list/dict/'type'/'columns' checks)
+    plus DSI-specific column-existence and quadratic_extrapolation-bool checks.
+    All bad specs must now raise ValueError (not AssertionError, not pass)."""
+
+    def test_transforms_not_a_list_raises(self):
+        """transforms must be a list -> ValueError (shared _validate_transforms)."""
+        data, obsdata = _synth_data()
+        with pytest.raises(ValueError):
+            DSI(data=data, pst=obsdata, transforms={"type": "log10"}, verbose=False)
+
+    def test_transform_missing_type_raises(self):
+        """A transform dict without a 'type' key -> ValueError (shared check)."""
+        data, obsdata = _synth_data()
+        with pytest.raises(ValueError):
+            DSI(data=data, pst=obsdata, transforms=[{"columns": ["obs0"]}], verbose=False)
+
+    def test_transform_unknown_column_raises(self):
+        """A 'columns' entry not present in data -> ValueError mentioning it."""
+        data, obsdata = _synth_data()
+        with pytest.raises(ValueError, match="not found in the data"):
+            DSI(
+                data=data,
+                pst=obsdata,
+                transforms=[{"type": "log10", "columns": ["nope"]}],
+                verbose=False,
+            )
+
+    def test_normal_score_quadratic_extrapolation_not_bool_raises(self):
+        """normal_score 'quadratic_extrapolation' must be a bool -> ValueError."""
+        data, obsdata = _synth_data()
+        with pytest.raises(ValueError):
+            DSI(
+                data=data,
+                pst=obsdata,
+                transforms=[{"type": "normal_score", "quadratic_extrapolation": "yes"}],
+                verbose=False,
+            )
+
+
+def test_forward_run_script_targets_after_shared_helper_refactor(tmp_path):
+    """Smoke test guarding the shared Emulator._write_forward_run_script_body
+    refactor: DSI and GPR _write_forward_run_script must still emit a script
+    whose final line calls the correct target function. We call the method
+    directly on fitted emulators (no PEST++ binaries) toggling _use_runstor."""
+    # --- DSI (file-based) -------------------------------------------------
+    data, obsdata = _synth_data()
+    dsi = DSI(data=data, pst=obsdata, verbose=False)
+    dsi.fit()
+    dsi._use_runstor = False
+    dsi_script = str(tmp_path / "dsi_forward_run.py")
+    dsi._write_forward_run_script(
+        dsi_script, "dsi.pickle", "dsi_pars.csv", "dsi_sim_vals.csv", "DSI"
+    )
+    with open(dsi_script, "r") as f:
+        dsi_content = f.read()
+    dsi_lines = [ln for ln in dsi_content.splitlines() if ln.strip() != ""]
+    assert dsi_lines[-1].startswith("    dsi_file_forward_run(")
+    # the helper must embed the import header and all three function sources
+    assert "import pickle" in dsi_content
+    assert dsi_content.count("# Source for ") == 3
+
+    # --- GPR (runstor) ----------------------------------------------------
+    x = np.linspace(0.0, 10.0, 20)
+    df = pd.DataFrame({"x": x, "y": 2.0 * x + 1.0})
+    gpr = GPR(data=df, input_names=["x"], output_names=["y"], verbose=False)
+    gpr.fit()
+    gpr._use_runstor = True
+    gpr_script = str(tmp_path / "gpr_forward_run.py")
+    gpr._write_forward_run_script(
+        gpr_script, "emulator.pkl", "in.csv", "out.csv", "GPR", pst_name="chk"
+    )
+    with open(gpr_script, "r") as f:
+        gpr_content = f.read()
+    gpr_lines = [ln for ln in gpr_content.splitlines() if ln.strip() != ""]
+    assert gpr_lines[-1].startswith("    gpr_runstore_forward_run(emu_file=")
+    assert "import pickle" in gpr_content
+    assert gpr_content.count("# Source for ") == 3
+
+
 class TestGPRFitPredict:
     """Unit-level tests for GPR core logic (no PEST++ binaries)."""
 
