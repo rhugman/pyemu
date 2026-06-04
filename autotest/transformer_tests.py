@@ -7,6 +7,7 @@ import pandas as pd
 import platform
 sys.path.append("..")
 import pyemu
+import pyemu.emulators
 
 def test_base_transformer():
     """Test the BaseTransformer abstract class functionality"""
@@ -335,6 +336,75 @@ def test_autobots_assemble():
     # Check we get back close to original values
     np.testing.assert_allclose(back_bb.values, original_df.values, rtol=0.1)
 
+
+
+def test_normal_score_tied_minimum_strictly_increasing():
+    """Regression: ties at the data minimum (magnitude >= 1) must not survive
+    in the fitted 'originals' array, which must be strictly increasing."""
+    # Detection-limit style run: 8 ties at 100.0 then an increasing tail
+    col = 'tied_min'
+    values = np.concatenate([np.full(8, 100.0), np.linspace(101, 120, 22)])
+    df = pd.DataFrame({col: values})
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=False)
+    nst.fit(df)
+
+    originals = np.asarray(nst.column_parameters[col]['originals'])
+
+    # Tied values must have been separated so np.interp gets a valid xp
+    assert np.all(np.diff(originals) > 0)
+
+
+def test_normal_score_tied_minimum_extrapolation_finite():
+    """Regression: with tied minimum values and quadratic extrapolation,
+    transforming a below-minimum value must be finite (not +/-inf)."""
+    col = 'tied_min'
+    values = np.concatenate([np.full(8, 100.0), np.linspace(101, 120, 22)])
+    df = pd.DataFrame({col: values})
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    # 90.0 is below the data minimum (100.0), forcing below-min extrapolation
+    probe = pd.DataFrame({col: [90.0]})
+    transformed = nst.transform(probe)
+
+    # Only finiteness is asserted; magnitude of degenerate-pair
+    # extrapolation is intentionally out of scope
+    assert np.all(np.isfinite(transformed[col].values))
+
+
+def test_normal_score_tied_maximum_extrapolation_finite():
+    """Regression: with tied maximum values and quadratic extrapolation,
+    transforming an above-maximum value must be finite (not +/-inf)."""
+    col = 'tied_max'
+    values = np.concatenate([np.linspace(80, 99, 22), np.full(8, 100.0)])
+    df = pd.DataFrame({col: values})
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    # 110.0 is above the data maximum (100.0), forcing above-max extrapolation
+    probe = pd.DataFrame({col: [110.0]})
+    transformed = nst.transform(probe)
+
+    assert np.all(np.isfinite(transformed[col].values))
+
+
+def test_normal_score_tied_minimum_round_trip():
+    """Sanity: round-trip inverse_transform(transform(x)) recovers in-range
+    probes on the tied-minimum data."""
+    col = 'tied_min'
+    values = np.concatenate([np.full(8, 100.0), np.linspace(101, 120, 22)])
+    df = pd.DataFrame({col: values})
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    probe = pd.DataFrame({col: [100.0, 100.5, 110.0]})
+    round_trip = nst.inverse_transform(nst.transform(probe))
+
+    np.testing.assert_allclose(round_trip[col].values, probe[col].values)
 
 
 def skewness(x):

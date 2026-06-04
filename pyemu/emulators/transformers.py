@@ -667,10 +667,12 @@ class NormalScoreTransformer(BaseTransformer):
         smoothed_y[0] = y_values[0]
         smoothed_y[-1] = y_values[-1]
         
-        # Ensure monotonicity
+        # Ensure strict monotonicity; np.nextafter gives the smallest
+        # representable increment at any magnitude (a fixed epsilon like 1e-16
+        # is a no-op for values >= ~1)
         for i in range(1, len(smoothed_y)):
             if smoothed_y[i] <= smoothed_y[i - 1]:
-                smoothed_y[i] = smoothed_y[i - 1] + 1e-16
+                smoothed_y[i] = np.nextafter(smoothed_y[i - 1], np.inf)
 
         return smoothed_y
 
