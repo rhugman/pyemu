@@ -2,6 +2,7 @@
 Gaussian Process Regression (GPR) emulator implementation.
 """
 from __future__ import print_function, division
+import copy
 import numpy as np
 import pandas as pd
 import os
@@ -71,7 +72,9 @@ class GPR(Emulator):
         self.output_names = output_names
 
         self.kernel = kernel
-        self.transforms = transforms
+        # deep-copy so the shared default list and caller-owned dicts are never
+        # mutated by _validate_transforms_for_gpr
+        self.transforms = copy.deepcopy(transforms) if transforms is not None else None
         self.n_restarts_optimizer = n_restarts_optimizer
         self.return_std = return_std
         
@@ -96,8 +99,9 @@ class GPR(Emulator):
         # Validate transforms parameter
         transforms = self.transforms
         if transforms is not None:
-            # For the speicif case of GPR, we only transform input data    
-            for t in transforms:
+            # For the speicif case of GPR, we only transform input data
+            # iterate over a snapshot: transforms may be removed from the list
+            for t in list(transforms):
                 if 'columns' in t:
                     # check if any columns are in output_names
                     if self.output_names is not None:
@@ -254,20 +258,23 @@ class GPR(Emulator):
         # Apply same transforms as training data
         X_transformed = self.transformer_pipeline.transform(X.copy())
 
-        
+        # align to the column order used in fit(); raises KeyError if an
+        # input column is missing
+        X_values = X_transformed.loc[:, self.input_names].values
+
         # Make predictions for each output
         predictions_dict = {}
         std_dict = {}
-        
+
         for output_name in self.output_names:
             gpr = self.gpr_models[output_name]
-            
+
             if return_std:
-                pred, std = gpr.predict(X_transformed.values, return_std=True)
+                pred, std = gpr.predict(X_values, return_std=True)
                 predictions_dict[output_name] = pred
                 std_dict[output_name] = std
             else:
-                pred = gpr.predict(X_transformed.values)
+                pred = gpr.predict(X_values)
                 predictions_dict[output_name] = pred
         
         # Convert to DataFrame

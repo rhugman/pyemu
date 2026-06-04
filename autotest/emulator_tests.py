@@ -1318,6 +1318,98 @@ class TestGPRFitPredict:
             pred_before["y"].values, pred_after["y"].values, atol=1e-10
         )
 
+    # -- regression tests for transform-copy (f6) and predict alignment (f8) --
+
+    @staticmethod
+    def _two_input_gpr_data(seed=0):
+        """y = x1 + 2*x2, two inputs, small DataFrame."""
+        rng = np.random.RandomState(seed)
+        x1 = rng.uniform(0.0, 10.0, 25)
+        x2 = rng.uniform(0.0, 10.0, 25)
+        df = pd.DataFrame({"x1": x1, "x2": x2, "y": x1 + 2.0 * x2})
+        return df
+
+    def test_default_transforms_not_shared(self):
+        """Two GPRs built with the DEFAULT transforms do not share transform state."""
+        df = self._two_input_gpr_data()
+
+        gpr_a = GPR(data=df, input_names=["x1"], output_names=["y"], verbose=False)
+        gpr_b = GPR(data=df, input_names=["x1", "x2"], output_names=["y"], verbose=False)
+
+        # each instance's transform columns reflect its own input_names
+        assert gpr_a.transforms[0]["columns"] == ["x1"]
+        assert gpr_b.transforms[0]["columns"] == ["x1", "x2"]
+
+        # the two transforms objects (and their inner dicts) are distinct objects
+        assert gpr_a.transforms is not gpr_b.transforms
+        assert gpr_a.transforms[0] is not gpr_b.transforms[0]
+
+    def test_caller_transforms_not_mutated(self):
+        """A caller-supplied transforms list is not mutated by constructing a GPR."""
+        df = self._two_input_gpr_data()
+        caller_transforms = [{"type": "standard_scaler", "columns": ["x1", "y"]}]
+
+        GPR(
+            data=df,
+            input_names=["x1"],
+            output_names=["y"],
+            transforms=caller_transforms,
+            verbose=False,
+        )
+
+        # the caller's list and dict are untouched ('y' is an output)
+        assert caller_transforms == [{"type": "standard_scaler", "columns": ["x1", "y"]}]
+
+    def test_adjacent_output_only_transforms_removed(self):
+        """Two adjacent output-only transforms are both removed."""
+        df = self._two_input_gpr_data()
+        transforms = [
+            {"type": "standard_scaler", "columns": ["y"]},
+            {"type": "log10", "columns": ["y"]},
+        ]
+
+        gpr = GPR(
+            data=df,
+            input_names=["x1", "x2"],
+            output_names=["y"],
+            transforms=transforms,
+            verbose=False,
+        )
+
+        assert len(gpr.transforms) == 0
+
+    def test_predict_column_order_invariant(self):
+        """predict gives the same result regardless of input column order."""
+        df = self._two_input_gpr_data()
+        gpr = GPR(
+            data=df,
+            input_names=["x1", "x2"],
+            output_names=["y"],
+            n_restarts_optimizer=0,
+            verbose=False,
+        )
+        gpr.fit()
+
+        pred_normal = gpr.predict(df[["x1", "x2"]])
+        pred_swapped = gpr.predict(df[["x2", "x1"]])
+
+        np.testing.assert_allclose(pred_normal.values, pred_swapped.values)
+
+    def test_predict_missing_input_raises(self):
+        """predict with a missing input column raises KeyError."""
+        df = self._two_input_gpr_data()
+        gpr = GPR(
+            data=df,
+            input_names=["x1", "x2"],
+            output_names=["y"],
+            n_restarts_optimizer=0,
+            verbose=False,
+        )
+        gpr.fit()
+
+        with pytest.raises(KeyError):
+            gpr.predict(df[["x1"]])
+
 
 # ===========================================================================
 # Transformer unit tests
