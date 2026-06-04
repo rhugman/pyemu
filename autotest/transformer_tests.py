@@ -78,6 +78,90 @@ def test_log10_transformer():
         rtol=1e-6
     )
 
+def test_log10_transform_uses_fitted_shift_on_new_frame():
+    """Regression: fit() learns a per-column shift; transform() on a second,
+    positive-min frame must use the FITTED shift (not re-learn it). The same
+    value transforms identically whether it appears in the training frame or a
+    new frame, and self.shifts is unchanged after transforming new data."""
+    # Training column has min <= 0 -> a nonzero shift is learned on fit.
+    train = pd.DataFrame({'a': [-5.0, 0.0, 10.0]})
+    t = pyemu.emulators.Log10Transformer(columns=['a'])
+    t.fit(train)
+
+    fitted_shift = t.shifts['a']
+    assert fitted_shift > 0  # -(-5) + 1e-6
+
+    # The value 10.0 appears in the training frame; transform it there.
+    train_transformed = t.transform(train)
+    train_val_10 = train_transformed['a'].iloc[2]
+
+    # A second frame with a *positive* min (so a re-learned shift would be 0).
+    new_frame = pd.DataFrame({'a': [10.0, 20.0, 30.0]})
+    new_transformed = t.transform(new_frame)
+
+    # Same input value -> same output, because the FITTED shift is used.
+    assert np.isclose(new_transformed['a'].iloc[0], train_val_10)
+    np.testing.assert_allclose(
+        new_transformed['a'].values,
+        np.log10(new_frame['a'].values + fitted_shift),
+    )
+
+    # Transforming new data must NOT have overwritten the fitted shift.
+    assert t.shifts['a'] == fitted_shift
+
+
+def test_log10_roundtrip_survives_intervening_transform():
+    """Regression (state corruption): inverse_transform(transform(train)) must
+    round-trip, AND must still round-trip after an intervening transform() on a
+    different positive-min frame. Pre-fix the intervening call overwrote the
+    fitted shift and broke the round-trip."""
+    train = pd.DataFrame({'a': [-5.0, 0.0, 10.0]})
+    t = pyemu.emulators.Log10Transformer(columns=['a'])
+    t.fit(train)
+
+    # Transform train ONCE and keep the result.
+    transformed = t.transform(train)
+
+    # Round-trip before any intervening call.
+    inversed = t.inverse_transform(transformed)
+    np.testing.assert_allclose(inversed['a'].values, train['a'].values, atol=1e-5)
+
+    # Intervening transform on a different, positive-min frame. Pre-fix this
+    # re-learns a 0 shift and overwrites the stored training shift, so the
+    # SAME already-transformed train data no longer inverts correctly.
+    other = pd.DataFrame({'a': [10.0, 20.0, 30.0]})
+    _ = t.transform(other)
+
+    # Invert the SAME transformed train data; the stored shift must be intact.
+    inversed2 = t.inverse_transform(transformed)
+    np.testing.assert_allclose(inversed2['a'].values, train['a'].values, atol=1e-5)
+
+
+def test_log10_below_fitted_domain_raises():
+    """Regression: transforming a value below the fitted domain
+    (X[col] + shift <= 0) must raise ValueError."""
+    train = pd.DataFrame({'a': [-5.0, 0.0, 10.0]})
+    t = pyemu.emulators.Log10Transformer(columns=['a'])
+    t.fit(train)
+
+    # fitted shift is ~5; a value of -6 gives -6 + 5 + 1e-6 < 0 -> out of domain.
+    below_domain = pd.DataFrame({'a': [-6.0]})
+    with pytest.raises(ValueError):
+        t.transform(below_domain)
+
+
+def test_log10_bare_transform_autofits():
+    """Backward compat: calling transform() without an explicit fit() still
+    works (auto-fit on first use)."""
+    df = pd.DataFrame({'a': [1.0, 10.0, 100.0]})
+    t = pyemu.emulators.Log10Transformer(columns=['a'])
+
+    # No fit() call; transform must auto-fit and produce log10 values.
+    result = t.transform(df)
+    np.testing.assert_allclose(result['a'].values, [0.0, 1.0, 2.0], atol=1e-10)
+    assert t.shifts['a'] == 0
+
+
 def test_row_wise_minmax_scaler():
     """Test the RowWiseMinMaxScaler functionality"""
     # Test data

@@ -50,16 +50,32 @@ class Log10Transformer(BaseTransformer):
         self.columns = columns
         self.shifts = {}
 
-    def transform(self, X):
-        result = X.copy()
+    def fit(self, X):
+        """Learn per-column shifts so non-positive columns can be log-transformed."""
         columns = self.columns if self.columns is not None else X.columns
         columns = [col for col in columns if col in X.columns]
-        
+        self.shifts = {}
         for col in columns:
             min_val = X[col].min()
-            shift = -min_val + 1e-6 if min_val <= 0 else 0
-            self.shifts[col] = shift
-            result[col] = np.log10(X[col] + shift)
+            self.shifts[col] = -min_val + 1e-6 if min_val <= 0 else 0
+        return self
+
+    def transform(self, X):
+        # auto-fit on first use (consistent with MinMaxScaler/RowWiseMinMaxScaler);
+        # shifts are fitted state and must NOT be re-learned on later calls
+        if not self.shifts:
+            self.fit(X)
+        result = X.copy()
+        for col, shift in self.shifts.items():
+            if col not in X.columns:
+                continue
+            shifted = X[col] + shift
+            if (shifted <= 0).any():
+                raise ValueError(
+                    f"Log10Transformer: column '{col}' has values <= {-shift} "
+                    "(below the range seen in fit); cannot log10-transform"
+                )
+            result[col] = np.log10(shifted)
         return result
 
     def inverse_transform(self, X):

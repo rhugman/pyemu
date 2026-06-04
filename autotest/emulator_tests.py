@@ -1216,6 +1216,68 @@ class TestDSIFitPredict:
         assert len(result) == data.shape[1]
         assert np.all(np.isfinite(result.values))
 
+    def test_dsi_log10_rowwise_keeps_training_shifts(self):
+        """Regression: with a log10 transform AND rowwise_groups, DSI.__init__
+        pre-fits the truth row-wise scaler by calling
+        transformer_pipeline.transform(truth_df) on a 1-row truth frame. That
+        call must NOT overwrite the Log10Transformer's fitted training shifts.
+        After construction the Log10Transformer must still hold the TRAINING
+        shifts (-train_min + 1e-6), not 0 (which is what the positive-obsval
+        truth prefit would have re-learned pre-fix)."""
+        from pyemu.emulators.transformers import Log10Transformer
+
+        data, _ = _synth_data()
+        # Force log10 columns to have a min < 0 so a nonzero shift is learned.
+        log_cols = ["obs0", "obs1"]
+        for col in log_cols:
+            data[col] = data[col] - 10.0  # min is now strongly negative
+        train_mins = {col: data[col].min() for col in log_cols}
+        for col in log_cols:
+            assert train_mins[col] < 0
+
+        # obsdata (pst): index = obs names, 'obsval' column, all POSITIVE obsvals.
+        # Positive truth values are exactly what would re-learn a 0 shift pre-fix.
+        obsdata = pd.DataFrame(
+            {
+                "obsnme": data.columns,
+                "obsval": 1.0,  # positive for every obs
+                "weight": 1.0,
+                "obgnme": "obgnme",
+            },
+            index=data.columns,
+        )
+
+        transforms = [{"type": "log10", "columns": log_cols}]
+        rowwise_groups = {
+            "g1": [f"obs{i}" for i in range(5)],
+            "g2": [f"obs{i}" for i in range(5, 10)],
+        }
+
+        # Constructing DSI runs the truth prefit in __init__.
+        dsi = DSI(
+            data=data,
+            pst=obsdata,
+            transforms=transforms,
+            rowwise_groups=rowwise_groups,
+            verbose=False,
+        )
+
+        # Locate the Log10Transformer inside the fitted pipeline.
+        log_transformers = [
+            tr
+            for tr, _cols in dsi.transformer_pipeline.pipeline.transformers
+            if isinstance(tr, Log10Transformer)
+        ]
+        assert len(log_transformers) == 1
+        log_tr = log_transformers[0]
+
+        # Shifts must still be the TRAINING shifts, not zeroed by the truth prefit.
+        for col in log_cols:
+            expected = -train_mins[col] + 1e-6
+            assert col in log_tr.shifts
+            assert np.isclose(log_tr.shifts[col], expected)
+            assert log_tr.shifts[col] != 0
+
 
 class TestGPRFitPredict:
     """Unit-level tests for GPR core logic (no PEST++ binaries)."""
