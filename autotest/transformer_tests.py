@@ -718,3 +718,200 @@ def test_normal_score_deprecated_kwargs_are_noops():
         nst_default.column_parameters['a']['z_scores'],
         nst_kwargs.column_parameters['a']['z_scores'],
     )
+
+
+# ---------------------------------------------------------------------------
+# Quadratic-extrapolation tail tests (monotone quadratic tails replacing the
+# former linear end-pair extrapolation in NormalScoreTransformer).
+# ---------------------------------------------------------------------------
+
+def _curved_frame(col='c', n=60, seed=42):
+    """Curved single-column frame: np.exp of seeded normals (genuinely curved
+    in original space, so the quadratic tails differ from a straight line)."""
+    rng = np.random.RandomState(seed)
+    return pd.DataFrame({col: np.exp(rng.normal(0, 1, n))})
+
+
+def _old_linear_below_z(originals, z_scores, v):
+    """OLD (pre-fix) forward extrapolation below the data minimum: linear in the
+    end knot PAIR, slope = (z1 - z0) / (o1 - o0)."""
+    o = np.asarray(originals, dtype=float)
+    z = np.asarray(z_scores, dtype=float)
+    min_orig, min_z = o.min(), z.min()
+    slope = (z[1] - z[0]) / (o[1] - o[0])
+    return min_z + slope * (v - min_orig)
+
+
+def _old_linear_above_z(originals, z_scores, v):
+    """OLD (pre-fix) forward extrapolation above the data maximum: linear in the
+    end knot PAIR, slope = (z[-1] - z[-2]) / (o[-1] - o[-2])."""
+    o = np.asarray(originals, dtype=float)
+    z = np.asarray(z_scores, dtype=float)
+    max_orig, max_z = o.max(), z.max()
+    slope = (z[-1] - z[-2]) / (o[-1] - o[-2])
+    return max_z + slope * (v - max_orig)
+
+
+def test_normal_score_quadratic_tail_round_trip_both_tails():
+    """(a) Round-trip exactness in BOTH tails on curved data:
+    inverse_transform(transform(x)) == x for probes below the data minimum and
+    above the data maximum (transform uses the cancellation-free quadratic root
+    so it is an exact inverse of the tail curve)."""
+    col = 'c'
+    df = _curved_frame(col)
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    originals = np.asarray(nst.column_parameters[col]['originals'])
+    min_orig, max_orig = originals.min(), originals.max()
+    span = max_orig - min_orig
+
+    # probes strictly below the minimum and strictly above the maximum
+    below = np.array([min_orig - 0.05 * span, min_orig - 0.5 * span, min_orig - span])
+    above = np.array([max_orig + 0.05 * span, max_orig + 0.5 * span, max_orig + span])
+    probe = pd.DataFrame({col: np.concatenate([below, above])})
+
+    round_trip = nst.inverse_transform(nst.transform(probe))
+    np.testing.assert_allclose(round_trip[col].values, probe[col].values, rtol=1e-9, atol=1e-9)
+
+
+def test_normal_score_quadratic_tail_is_actually_quadratic():
+    """(b) The upper tail honours curvature: inverse over a uniform z-grid beyond
+    the max z has a nonzero second difference (a straight line would give zero),
+    AND the forward transform of an out-of-range value differs from the OLD
+    end-pair linear extrapolation formula."""
+    col = 'c'
+    df = _curved_frame(col)
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    originals = np.asarray(nst.column_parameters[col]['originals'])
+    z_scores = np.asarray(nst.column_parameters[col]['z_scores'])
+    max_z = z_scores.max()
+    max_orig = originals.max()
+
+    # uniform z-grid beyond the max z; inverse should be curved (nonzero d2)
+    z_grid = max_z + np.linspace(0.2, 2.0, 9)
+    inv = nst.inverse_transform(pd.DataFrame({col: z_grid}))[col].values
+    second_diff = np.diff(inv, 2)
+    assert np.max(np.abs(second_diff)) > 1e-8, "upper tail is straight, not quadratic"
+
+    # forward transform of an above-max value must differ from OLD linear formula
+    span = max_orig - originals.min()
+    v = max_orig + 0.5 * span
+    got = nst.transform(pd.DataFrame({col: [v]}))[col].values[0]
+    old_linear = _old_linear_above_z(originals, z_scores, v)
+    assert not np.isclose(got, old_linear, rtol=1e-6, atol=1e-9), \
+        "quadratic forward transform coincides with old linear end-pair formula"
+
+
+def test_normal_score_quadratic_tail_monotone_and_finite():
+    """(c) transform of a fine grid spanning [min-2, max+2] is strictly
+    increasing and finite, for BOTH the curved data and a tied-end dataset."""
+    curved = _curved_frame('c')
+    tied = pd.DataFrame({'t': np.concatenate([np.linspace(1, 99, 32), np.full(8, 100.0)])})
+
+    for df, col in [(curved, 'c'), (tied, 't')]:
+        nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+        nst.fit(df)
+
+        originals = np.asarray(nst.column_parameters[col]['originals'])
+        grid = np.linspace(originals.min() - 2.0, originals.max() + 2.0, 500)
+        z = nst.transform(pd.DataFrame({col: grid}))[col].values
+
+        assert np.all(np.isfinite(z)), f"non-finite transform on {col}"
+        assert np.all(np.diff(z) > 0), f"transform not strictly increasing on {col}"
+
+
+def test_normal_score_tied_end_residual_regression():
+    """(d) Tied-end sanity (f9-residual regression): on the tied-end dataset,
+    transform(100.5) is a small z-score between 2 and 10 (pre-fix the degenerate
+    end-pair slope blew this up to ~1e13)."""
+    col = 't'
+    df = pd.DataFrame({col: np.concatenate([np.linspace(1, 99, 32), np.full(8, 100.0)])})
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    z = nst.transform(pd.DataFrame({col: [100.5]}))[col].values[0]
+    assert 2.0 < z < 10.0, f"tied-end transform(100.5) = {z}, expected in (2, 10)"
+
+
+def test_normal_score_quadratic_n1_clamps_no_crash():
+    """(e) n=1 with quadratic_extrapolation=True: no crash (pre-fix this raised
+    IndexError); out-of-range values clamp to the boundary."""
+    col = 'c'
+    df = pd.DataFrame({col: [5.0]})
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    originals = np.asarray(nst.column_parameters[col]['originals'])
+    z_scores = np.asarray(nst.column_parameters[col]['z_scores'])
+    min_z, max_z = z_scores.min(), z_scores.max()
+    min_orig, max_orig = originals.min(), originals.max()
+
+    # forward transform of below/above values must not crash and must clamp to z
+    fwd = nst.transform(pd.DataFrame({col: [1.0, 5.0, 9.0]}))[col].values
+    assert np.all(np.isfinite(fwd))
+    assert fwd[0] == min_z
+    assert fwd[2] == max_z
+
+    # inverse transform of below/above z must clamp to the boundary original
+    inv = nst.inverse_transform(pd.DataFrame({col: [min_z - 3.0, max_z + 3.0]}))[col].values
+    assert np.all(np.isfinite(inv))
+    assert inv[0] == min_orig
+    assert inv[1] == max_orig
+
+
+def test_normal_score_quadratic_constant_column_clamps():
+    """(f) Constant column with quadratic_extrapolation=True: out-of-range values
+    clamp to the boundary z-scores / originals (no explosion)."""
+    col = 'c'
+    df = pd.DataFrame({col: np.full(40, 7.0)})
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst.fit(df)
+
+    originals = np.asarray(nst.column_parameters[col]['originals'])
+    z_scores = np.asarray(nst.column_parameters[col]['z_scores'])
+    min_z, max_z = z_scores.min(), z_scores.max()
+    min_orig, max_orig = originals.min(), originals.max()
+
+    fwd = nst.transform(pd.DataFrame({col: [1.0, 100.0]}))[col].values
+    assert np.all(np.isfinite(fwd))
+    assert fwd[0] == min_z
+    assert fwd[1] == max_z
+
+    inv = nst.inverse_transform(pd.DataFrame({col: [min_z - 5.0, max_z + 5.0]}))[col].values
+    assert np.all(np.isfinite(inv))
+    assert inv[0] == min_orig
+    assert inv[1] == max_orig
+
+
+def test_normal_score_clamp_false_unchanged():
+    """(g) clamp behaviour (quadratic_extrapolation=False) is unchanged:
+    out-of-range maps exactly to the boundary z / boundary original."""
+    col = 'c'
+    df = _curved_frame(col)
+
+    nst = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=False)
+    nst.fit(df)
+
+    originals = np.asarray(nst.column_parameters[col]['originals'])
+    z_scores = np.asarray(nst.column_parameters[col]['z_scores'])
+    min_z, max_z = z_scores.min(), z_scores.max()
+    min_orig, max_orig = originals.min(), originals.max()
+    span = max_orig - min_orig
+
+    # forward: below/above the data range clamp exactly to boundary z
+    fwd = nst.transform(pd.DataFrame({col: [min_orig - span, max_orig + span]}))[col].values
+    assert fwd[0] == min_z
+    assert fwd[1] == max_z
+
+    # inverse: below/above the z range clamp exactly to boundary original
+    inv = nst.inverse_transform(pd.DataFrame({col: [min_z - 5.0, max_z + 5.0]}))[col].values
+    assert inv[0] == min_orig
+    assert inv[1] == max_orig

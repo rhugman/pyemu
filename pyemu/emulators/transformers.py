@@ -472,7 +472,11 @@ class NormalScoreTransformer(BaseTransformer):
         Deprecated, no effect. Retained for backward compatibility with the
         former Monte-Carlo z-score routine.
     quadratic_extrapolation : bool, default=False
-        Whether to use quadratic extrapolation for values outside the fitted range.
+        If True, values outside the fitted range are mapped with a monotone
+        quadratic curve fitted through the three boundary knots of each tail
+        (analytically inverted, so transform and inverse_transform remain
+        exact inverses in the tails). If False (default), out-of-range values
+        are clamped to the boundary z-score / original value.
     columns : list, optional
         List of column names to be transformed. If None, all columns will be transformed.
 
@@ -522,7 +526,67 @@ class NormalScoreTransformer(BaseTransformer):
             )
         i = np.arange(1, n + 1)
         return norm.ppf((i - 0.375) / (n + 0.25))
-        
+
+    @staticmethod
+    def _tail_coefficients(originals, z_scores):
+        """Monotone quadratic tail curves for extrapolation beyond the fitted knots.
+
+        Each tail is a parabola in z, ``o(z_b + t) = o_b + b*t + a*t**2`` with
+        ``(z_b, o_b)`` the boundary knot, fitted through the boundary knot and
+        the two nearest knots whose original values genuinely differ from it.
+        Skipping value-tied knots (one-ULP gaps from the fit-time monotonicity
+        guard) keeps tie runs from producing near-zero slopes, and fitting in z
+        keeps all denominators as z-knot gaps, which are always distinct.
+        Coefficients are constrained so each curve is strictly increasing on
+        its extrapolation side (vertex outside the domain), falling back to
+        the chosen knots' mean slope otherwise.
+
+        Returns ``((a_lo, b_lo), (a_hi, b_hi))``; a tail entry is None when
+        that tail has no informative variation (callers should clamp). Returns
+        None outright when n < 2 (no extrapolation possible).
+        """
+        z = np.asarray(z_scores, dtype=float)
+        o = np.asarray(originals, dtype=float)
+        n = len(z)
+        if n < 2:
+            return None
+        # value gaps at or below this are monotonicity-guard artifacts, not
+        # data: the fit-time guard can stack up to n one-ULP steps
+        tol = max(1e-9 * (o[-1] - o[0]), (n + 1.0) * np.spacing(max(abs(o[0]), abs(o[-1]))))
+
+        def tail(indices, lower):
+            ib = indices[0]  # boundary knot
+            picked = [ib]
+            for i in indices[1:]:
+                if abs(o[i] - o[picked[-1]]) > tol:
+                    picked.append(i)
+                    if len(picked) == 3:
+                        break
+            if len(picked) < 2:
+                return None  # no informative variation on this tail
+            if len(picked) == 2:
+                s = (o[picked[1]] - o[ib]) / (z[picked[1]] - z[ib])
+                return 0.0, s
+            # order the three knots by ascending z; boundary is z1 (lower tail)
+            # or z3 (upper tail)
+            i1, i2, i3 = picked if lower else picked[::-1]
+            s12 = (o[i2] - o[i1]) / (z[i2] - z[i1])
+            s23 = (o[i3] - o[i2]) / (z[i3] - z[i2])
+            a = (s23 - s12) / (z[i3] - z[i1])
+            if lower:
+                b = s12 - a * (z[i2] - z[i1])  # curve slope at the boundary knot
+                monotone = a <= 0 and b > 0    # increasing for all t <= 0
+            else:
+                b = s23 + a * (z[i3] - z[i2])  # curve slope at the boundary knot
+                monotone = a >= 0 and b > 0    # increasing for all t >= 0
+            if not monotone:
+                a, b = 0.0, (o[i3] - o[i1]) / (z[i3] - z[i1])
+            return a, b
+
+        lo = tail(range(n), lower=True)
+        hi = tail(range(n - 1, -1, -1), lower=False)
+        return lo, hi
+
     def transform(self, X):
         """Transform the data using normal score transformation.
         
@@ -564,25 +628,30 @@ class NormalScoreTransformer(BaseTransformer):
             # For values outside range, use extrapolation if enabled or clamp to bounds
             below_min = values < min_orig
             above_max = values > max_orig
-            
+
+            tails = None
+            if self.quadratic_extrapolation and (below_min.any() or above_max.any()):
+                tails = self._tail_coefficients(originals, z_scores)
+
             if below_min.any():
-                if self.quadratic_extrapolation:
-                    # Use linear extrapolation below minimum
-                    slope = (z_scores[1] - z_scores[0]) / (originals[1] - originals[0])
-                    result.loc[below_min, col] = min_z + slope * (values[below_min] - min_orig)
+                if tails is not None and tails[0] is not None:
+                    # solve o_b + b*t + a*t**2 = v for t (cancellation-free root)
+                    a, b = tails[0]
+                    d = values[below_min] - min_orig
+                    result.loc[below_min, col] = min_z + 2.0 * d / (b + np.sqrt(b * b + 4.0 * a * d))
                 else:
                     # Otherwise clamp to minimum z-score
                     result.loc[below_min, col] = min_z
-                    
+
             if above_max.any():
-                if self.quadratic_extrapolation:
-                    # Use linear extrapolation above maximum
-                    slope = (z_scores[-1] - z_scores[-2]) / (originals[-1] - originals[-2])
-                    result.loc[above_max, col] = max_z + slope * (values[above_max] - max_orig)
+                if tails is not None and tails[1] is not None:
+                    a, b = tails[1]
+                    d = values[above_max] - max_orig
+                    result.loc[above_max, col] = max_z + 2.0 * d / (b + np.sqrt(b * b + 4.0 * a * d))
                 else:
                     # Otherwise clamp to maximum z-score
                     result.loc[above_max, col] = max_z
-            
+
         return result
 
     def inverse_transform(self, X):
@@ -622,23 +691,26 @@ class NormalScoreTransformer(BaseTransformer):
             # For values outside the z-score range, use extrapolation if enabled
             below_min = values < min_z
             above_max = values > max_z
-            
+
+            tails = None
+            if self.quadratic_extrapolation and (below_min.any() or above_max.any()):
+                tails = self._tail_coefficients(originals, z_scores)
+
             if below_min.any():
-                if self.quadratic_extrapolation:
-                    # Use linear extrapolation below minimum z-score
-                    slope = (originals[1] - originals[0]) / (z_scores[1] - z_scores[0])
-                    intercept = originals[0] - slope * z_scores[0]
-                    result.loc[below_min, col] = slope * values[below_min] + intercept
+                if tails is not None and tails[0] is not None:
+                    # evaluate the lower tail curve o(min_z + t)
+                    a, b = tails[0]
+                    t = values[below_min] - min_z
+                    result.loc[below_min, col] = min_orig + b * t + a * t * t
                 else:
                     # Otherwise clamp to minimum original value
                     result.loc[below_min, col] = min_orig
-                    
+
             if above_max.any():
-                if self.quadratic_extrapolation:
-                    # Use linear extrapolation above maximum z-score
-                    slope = (originals[-1] - originals[-2]) / (z_scores[-1] - z_scores[-2])
-                    intercept = originals[-1] - slope * z_scores[-1]
-                    result.loc[above_max, col] = slope * values[above_max] + intercept
+                if tails is not None and tails[1] is not None:
+                    a, b = tails[1]
+                    t = values[above_max] - max_z
+                    result.loc[above_max, col] = max_orig + b * t + a * t * t
                 else:
                     # Otherwise clamp to maximum original value
                     result.loc[above_max, col] = max_orig
