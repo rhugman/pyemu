@@ -493,7 +493,8 @@ class Emulator:
            Subclasses must implement this method to handle specific return types and behaviors."""
         raise NotImplementedError("Subclasses must implement _write_forward_run_script")
 
-    def _write_forward_run_script_body(self, filename, funcs, target_func, call_args):
+    @staticmethod
+    def _write_forward_run_script_body(filename, funcs, target_func, call_args):
         """Write a self-contained forward_run.py: embeds the source of each
         function in `funcs` (via inspect.getsource) and calls
         `target_func(call_args)` under __main__."""

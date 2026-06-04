@@ -9,11 +9,13 @@ from .transformers import (
 import importlib.util
 from .base import Emulator
 from .dsi import DSI
+from .dsivc import DSIVC
 
 
 __all__ = [
     'Emulator',
     'DSI',
+    'DSIVC',
     'LPFA',
     'GPR',
     'DSIAE',
