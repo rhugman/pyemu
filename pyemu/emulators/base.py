@@ -29,11 +29,11 @@ class Emulator:
                 List of transformation specifications. Each dict should have:
                 - 'type': str - Type of transformation (e.g.,'log10', 'normal_score').
                 - 'columns': list of str,optional - Columns to apply the transformation to. If not supplied, transformation is applied to all columns.
-                - Additional kwargs for the transformation (e.g., 'quadratic_extrapolation' for normal score transform).
+                - Additional kwargs for the transformation (e.g., 'extrapolation' for normal score transform).
                 Example:
                 transforms = [
                     {'type': 'log10', 'columns': ['obs1', 'obs2']},
-                    {'type': 'normal_score', 'quadratic_extrapolation': True}
+                    {'type': 'normal_score', 'extrapolation': 'quadratic'}
                 ]
                 Default is None, which means no transformations will be applied.
         verbose : bool, optional
@@ -112,13 +112,12 @@ class Emulator:
         else:
             # Still need to set up a dummy transformer for inverse operations
             from .transformers import AutobotsAssemble
-            self.feature_transformer = AutobotsAssemble(data.copy())
+            self.transformer_pipeline = AutobotsAssemble(data.copy())
             self.data_transformed = data.copy()
-    
+
         return self.data_transformed
 
-        return 
-        
+
     def _fit_transformer_pipeline(self, data=None, transforms=None):
         """
         Apply feature transformations to data with customizable transformer sequence.
@@ -147,7 +146,7 @@ class Emulator:
         emulator.apply_feature_transforms(
             transforms=[
                 {'type': 'log10', 'columns': ['flow', 'heads']},
-                {'type': 'normal_score', 'columns': None, 'quadratic_extrapolation': True}
+                {'type': 'normal_score', 'columns': None, 'extrapolation': 'quadratic'}
             ]
         )
         """
@@ -331,7 +330,6 @@ class Emulator:
 
         # Allow subclasses to refine the PST object (e.g. transfer pestpp_options)
         self.logger.statement("Configuring final Pst object")
-        print(kwargs.get("observation_data", None))
         self._configure_pst_object(
                                 pst_obj, pst, 
                                 observation_data=kwargs.get("observation_data", None),

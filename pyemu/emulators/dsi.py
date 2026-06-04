@@ -49,11 +49,11 @@ class DSI(Emulator):
             List of transformation specifications. Each dict should have:
             - 'type': str - Type of transformation (e.g.,'log10', 'normal_score').
             - 'columns': list of str,optional - Columns to apply the transformation to. If not supplied, transformation is applied to all columns.
-            - Additional kwargs for the transformation (e.g., 'quadratic_extrapolation' for normal score transform).
+            - Additional kwargs for the transformation (e.g., 'extrapolation' for normal score transform).
             Example:
             transforms = [
                 {'type': 'log10', 'columns': ['obs1', 'obs2']},
-                {'type': 'normal_score', 'quadratic_extrapolation': True}
+                {'type': 'normal_score', 'extrapolation': 'quadratic'}
             ]
             Default is None, which means no transformations will be applied.
         energy_threshold : float, optional 
@@ -543,9 +543,8 @@ class DSI(Emulator):
         Prepare PEST++ interface for DSI.
         Overrides base method to handle specific DSI arguments like use_runstor
         """
-        self._use_runstor = use_runstor 
-        print(self._use_runstor)
-        
+        self._use_runstor = use_runstor
+
         # Maintain backward compatibility with explicit observation_data argument
         if observation_data is not None:
              if isinstance(observation_data, pd.DataFrame):
