@@ -614,3 +614,107 @@ def test_normal_score_with_external_data():
         nst.inverse_transform(external_transformed).values,
         rtol=1e-3
     )
+
+
+def _blom_reference(n):
+    """Analytical Blom expected normal order statistics, computed independently."""
+    from scipy.stats import norm
+    i = np.arange(1, n + 1)
+    return norm.ppf((i - 0.375) / (n + 0.25))
+
+
+def _rng_states_equal(s1, s2):
+    """Compare two pyemu.en.rng get_state() tuples for exact equality."""
+    # RandomState.get_state() -> (str, ndarray[uint32], int, int, float)
+    if s1[0] != s2[0]:
+        return False
+    if not np.array_equal(s1[1], s2[1]):
+        return False
+    return s1[2:] == s2[2:]
+
+
+def test_normal_score_fit_consumes_no_global_rng():
+    """fit must be deterministic and draw no numbers from the module-global RNG."""
+    rng = np.random.RandomState(7)
+    df = pd.DataFrame({
+        'a': rng.normal(0, 1, 40),
+        'b': rng.uniform(0, 5, 40),
+    })
+
+    before = pyemu.en.rng.get_state()
+    nst = pyemu.emulators.NormalScoreTransformer()
+    nst.fit(df)
+    after = pyemu.en.rng.get_state()
+
+    assert _rng_states_equal(before, after), \
+        "NormalScoreTransformer.fit consumed numbers from pyemu.en.rng"
+
+
+def test_normal_score_fit_is_deterministic_across_rng_advance():
+    """Two separate fits on the same frame must be identical even when the
+    global RNG is advanced between them (fit consumes no random numbers)."""
+    rng = np.random.RandomState(11)
+    df = pd.DataFrame({
+        'a': rng.normal(0, 1, 40),
+        'b': rng.uniform(0, 5, 40),
+    })
+
+    nst1 = pyemu.emulators.NormalScoreTransformer()
+    nst1.fit(df)
+
+    # advance the global RNG between the two fits
+    pyemu.en.rng.normal(size=1000)
+
+    nst2 = pyemu.emulators.NormalScoreTransformer()
+    nst2.fit(df)
+
+    for col in df.columns:
+        np.testing.assert_array_equal(
+            nst1.column_parameters[col]['z_scores'],
+            nst2.column_parameters[col]['z_scores'],
+        )
+
+    out1 = nst1.transform(df)
+    out2 = nst2.transform(df)
+    np.testing.assert_array_equal(out1.values, out2.values)
+
+
+def test_normal_score_z_table_matches_blom():
+    """Fitted z_scores must equal Blom's analytical formula exactly, be strictly
+    increasing, and be antisymmetric."""
+    n = 40
+    rng = np.random.RandomState(13)
+    df = pd.DataFrame({'a': rng.normal(0, 1, n)})
+
+    nst = pyemu.emulators.NormalScoreTransformer()
+    nst.fit(df)
+
+    z_scores = np.asarray(nst.column_parameters['a']['z_scores'])
+    expected = _blom_reference(n)
+
+    # exact equality with the analytical Blom formula
+    np.testing.assert_array_equal(z_scores, expected)
+
+    # strictly increasing
+    assert np.all(np.diff(z_scores) > 0)
+
+    # antisymmetric: z == -z[::-1]
+    np.testing.assert_allclose(z_scores, -z_scores[::-1])
+
+
+def test_normal_score_deprecated_kwargs_are_noops():
+    """tol and max_samples are accepted for backward compat and have no effect
+    on the fitted z-table."""
+    rng = np.random.RandomState(17)
+    df = pd.DataFrame({'a': rng.normal(0, 1, 40)})
+
+    nst_default = pyemu.emulators.NormalScoreTransformer()
+    nst_default.fit(df)
+
+    nst_kwargs = pyemu.emulators.NormalScoreTransformer(tol=1e-9, max_samples=5)
+    nst_kwargs.fit(df)
+
+    np.testing.assert_array_equal(
+        nst_default.column_parameters['a']['z_scores'],
+        nst_kwargs.column_parameters['a']['z_scores'],
+    )

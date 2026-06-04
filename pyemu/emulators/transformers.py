@@ -465,45 +465,63 @@ class NormalScoreTransformer(BaseTransformer):
     
     Parameters
     ----------
-    tol : float, default=1e-7
-        Tolerance for convergence in random generation.
-    max_samples : int, default=1000000
-        Maximum number of samples for random generation.
+    tol : float, optional
+        Deprecated, no effect. Retained for backward compatibility with the
+        former Monte-Carlo z-score routine.
+    max_samples : int, optional
+        Deprecated, no effect. Retained for backward compatibility with the
+        former Monte-Carlo z-score routine.
     quadratic_extrapolation : bool, default=False
         Whether to use quadratic extrapolation for values outside the fitted range.
     columns : list, optional
         List of column names to be transformed. If None, all columns will be transformed.
+
+    Notes
+    -----
+    The z-score table is the expected standard-normal order statistics,
+    approximated analytically with Blom's formula
+    ``norm.ppf((i - 0.375) / (n + 0.25))``. This departs from the PEST
+    ``randrealgen`` Monte-Carlo lineage (which it never bit-matched) and is
+    deterministic: fitting consumes no random numbers.
     """
 
     def __init__(self, tol=1e-7, max_samples=1000000, quadratic_extrapolation=False, columns=None):
-        self.tol = tol
-        self.max_samples = max_samples
+        self.tol = tol  # deprecated, unused
+        self.max_samples = max_samples  # deprecated, unused
         self.quadratic_extrapolation = quadratic_extrapolation
         self.columns = columns
         self.column_parameters = {}
-        self.shared_z_scores = {}
 
     def fit(self, X):
         """Fit the transformer to the data."""
         columns = self.columns if self.columns is not None else X.columns
         columns = [col for col in columns if col in X.columns]
-        
+
+        # every column has the same number of rows, so one z-score table
+        # serves all of them
+        z_scores = self._blom_scores(len(X)) if columns else None
         for col in columns:
             values = X[col].values
             sorted_vals = np.sort(values)
             smoothed_vals = self._moving_average_with_endpoints(sorted_vals)
 
-            n_points = len(smoothed_vals)
-            if n_points not in self.shared_z_scores:
-                self.shared_z_scores[n_points] = self._randrealgen_optimized(n_points)
-
-            z_scores = self.shared_z_scores[n_points]
-            
             self.column_parameters[col] = {
                 'z_scores': z_scores,
                 'originals': smoothed_vals,
             }
         return self
+
+    @staticmethod
+    def _blom_scores(n):
+        """Expected standard-normal order statistics via Blom's approximation."""
+        try:
+            from scipy.stats import norm
+        except ImportError:
+            raise ImportError(
+                "NormalScoreTransformer requires scipy. Install with: pip install scipy"
+            )
+        i = np.arange(1, n + 1)
+        return norm.ppf((i - 0.375) / (n + 0.25))
         
     def transform(self, X):
         """Transform the data using normal score transformation.
@@ -626,31 +644,6 @@ class NormalScoreTransformer(BaseTransformer):
                     result.loc[above_max, col] = max_orig
 
         return result
-
-    def _randrealgen_optimized(self, nreal):
-        rval = np.zeros(nreal)
-        nsamp = 0
-        numsort = (nreal + 1) // 2 if nreal % 2 == 0 else nreal // 2
-
-        while nsamp < self.max_samples:
-            nsamp += 1
-            work1 = pyemu.en.rng.normal(size=nreal)
-            work1.sort()
-
-            if nsamp > 1:
-                previous_mean = rval[:numsort] / (nsamp - 1)
-                rval[:numsort] += work1[:numsort]
-                current_mean = rval[:numsort] / nsamp
-                max_diff = np.max(np.abs(current_mean - previous_mean))
-
-                if max_diff <= self.tol:
-                    break
-            else:
-                rval[:numsort] = work1[:numsort]
-
-        rval[:numsort] /= nsamp
-        rval[numsort:] = -rval[:numsort][::-1] if nreal % 2 == 0 else np.concatenate(([-rval[numsort]], -rval[:numsort][::-1]))
-        return rval
 
     def _moving_average_with_endpoints(self, y_values):
         """Apply a moving average smoothing to an array while preserving endpoints."""
