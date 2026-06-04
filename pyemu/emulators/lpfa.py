@@ -221,7 +221,11 @@ class LPFA(Emulator):
         data = self.data
         if data is None:
             raise ValueError("No data provided and no data stored in the emulator")
-            
+
+        # lowercase all name-keyed state at intake (see Emulator._lowercase_intake)
+        self._lowercase_intake()
+        data = self.data
+
         # Split the data into training and test sets
         train, test = train_test_split(
             data, 

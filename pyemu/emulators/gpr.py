@@ -68,8 +68,10 @@ class GPR(Emulator):
             raise ValueError("input_names must be a list or None")
         if output_names is not None and not isinstance(output_names, list):
             raise ValueError("output_names must be a list or None")
-        self.input_names = input_names
-        self.output_names = output_names
+        # lowercase on entry so they keep matching the lowercased data columns
+        # (the PEST(++) world is lowercase; see Emulator._lowercase_intake)
+        self.input_names = [str(n).lower() for n in input_names] if input_names is not None else None
+        self.output_names = [str(n).lower() for n in output_names] if output_names is not None else None
 
         self.kernel = kernel
         # deep-copy so the shared default list and caller-owned dicts are never
@@ -88,7 +90,11 @@ class GPR(Emulator):
         
         # PEST++ integration
         self.template_dir = None
-        
+
+        # lowercase data columns and transform 'columns' lists at intake so they
+        # match the lowercased input_names/output_names before validation
+        self._lowercase_intake()
+
         # Validate transforms parameter
         if transforms is not None:
             self._validate_transforms(transforms)
@@ -254,9 +260,15 @@ class GPR(Emulator):
         
         if not hasattr(self, 'transformer_pipeline') or self.transformer_pipeline is None:
             raise ValueError("Emulator must be fitted and have valid transformations before prediction")
-        
+
+        # lowercase caller-supplied input columns so they align with the
+        # lowercased input_names / training columns (the PEST(++) world is
+        # lowercase); without this, .loc[:, self.input_names] silently mis-aligns
+        X = X.copy()
+        X.columns = [str(c).lower() for c in X.columns]
+
         # Apply same transforms as training data
-        X_transformed = self.transformer_pipeline.transform(X.copy())
+        X_transformed = self.transformer_pipeline.transform(X)
 
         # align to the column order used in fit(); raises KeyError if an
         # input column is missing

@@ -4896,6 +4896,7 @@ def gpr_runstore_forward_run(ws='.', emu_file="gpr_emulator.pkl", pst_name="gpr"
 
 def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
     import os
+    import re
     from pyemu.utils.helpers import RunStor
     try:
         from pyemu.emulators import DSIAE
@@ -4916,9 +4917,21 @@ def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
     rs = RunStor(fname)
     df = rs.get_data()
 
-    # sort par_names to match latent dimension order
-    # sort by the integer after the prefix
-    par_names.sort(key=lambda x: int(x.split("_")[-1]))
+    # sort par_names to match latent dimension order.
+    # predict() consumes pvals positionally (pmat @ pvals.T / decoder), so column i
+    # must be latent dimension i.  The latent index is the trailing integer of the
+    # parameter name; the regex handles both "p_3"/"sv_3" (DSI) and "dsi_par0000"
+    # (DSIAE), the latter of which int(x.split("_")[-1]) cannot parse.
+    def _latent_index(pname):
+        m = re.search(r"(\d+)$", pname)
+        if m is None:
+            raise ValueError(
+                "could not parse latent index (trailing integer) "
+                "from parameter name: {0}".format(pname)
+            )
+        return int(m.group(1))
+
+    par_names.sort(key=_latent_index)
 
     pvals = df.loc[:,par_names]
     assert pvals.shape[1] == latent_dim, "number of parameters in runstor does not match DSI latent dimension"

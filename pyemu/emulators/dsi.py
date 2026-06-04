@@ -76,6 +76,12 @@ class DSI(Emulator):
             self.observation_data = pst.copy()
         else:
              self.observation_data = None
+        if self.observation_data is not None:
+            # keep obs names in the lowercase PEST namespace (see Emulator._lowercase_intake)
+            if self.observation_data.index.dtype == object:
+                self.observation_data.index = self.observation_data.index.str.lower()
+            if "obsnme" in self.observation_data.columns:
+                self.observation_data["obsnme"] = self.observation_data["obsnme"].str.lower()
 
         #self.__org_parameter_data = pst.parameter_data.copy() if pst is not None else None
         #self.__org_control_data = pst.control_data.copy() #breaks pickling
@@ -102,6 +108,13 @@ class DSI(Emulator):
         # Row-wise scaling config (optional)
         self.rowwise_groups = rowwise_groups
         self.rowwise_fit_groups = rowwise_fit_groups if rowwise_fit_groups is not None else rowwise_groups
+        # rowwise group column lists must track the lowercased data columns
+        if self.rowwise_groups is not None:
+            self.rowwise_groups = {g: [str(c).lower() for c in cols]
+                                   for g, cols in self.rowwise_groups.items()}
+        if self.rowwise_fit_groups is not None:
+            self.rowwise_fit_groups = {g: [str(c).lower() for c in cols]
+                                       for g, cols in self.rowwise_fit_groups.items()}
         self.feature_range = feature_range
         self._rowwise_train_scaler = None
 
@@ -138,6 +151,10 @@ class DSI(Emulator):
         data = self.data
         if data is None:
             raise ValueError("No data stored in the emulator")
+
+        # lowercase all name-keyed state at intake (see Emulator._lowercase_intake)
+        self._lowercase_intake()
+        data = self.data
 
         self.logger.statement("applying feature transforms")
         # Always use the base class transformation method for consistency
@@ -546,19 +563,10 @@ class DSI(Emulator):
             f.write("END STANDARD_DEVIATION")
         pst_obj.pestpp_options['parcov'] = "dsi.unc"
 
-
-
-        # 2. DSI Specifics (Run Storage support)
-        if use_runstor:
-             # Create run storage file
-             # DSI needs the *original* ensemble for run storage
-             # Logic from original code:
-             pass 
-             # TODO: Port use_runstor logic properly or deprecate? 
-             # The current DSI implementation relied on 'dsi_runstore_forward_run' helper
-             # We should integrate that into the generic forward runner or adapt here.
-             # For now, we will stick to standard file-based runner for safety in this refactor.
-        #pst_obj.write(os.path.join(t_d, "dsi.pst"),version=2)
+        # Write the control file so the prepared template dir is complete.
+        # Callers may further modify the returned pst and write it again; their
+        # write simply overwrites this one.
+        pst_obj.write(os.path.join(t_d, "dsi.pst"), version=2)
         return pst_obj
     
     def prepare_dsivc(self, decvar_names, t_d=None, pst=None, oe=None, track_stack=False, dsi_args=None, percentiles=[0.25,0.75,0.5], mou_population_size=None,ies_exe_path="pestpp-ies"):

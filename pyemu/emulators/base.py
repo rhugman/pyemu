@@ -100,11 +100,16 @@ class Emulator:
         data = self.data
         if data is None:
             raise ValueError("No data provided and no data stored in the emulator")
- 
+
+        # lowercase all name-keyed state at intake so it matches the PEST(++)
+        # world (Pst, ins/tpl files, RunStor .rns files), which is lowercase
+        self._lowercase_intake()
+        data = self.data
+
          # Common preprocessing logic could go here
         self.logger.statement("preparing training data")
-        
-        # apply feature transformations if they exist, etc..        
+
+        # apply feature transformations if they exist, etc..
         # Always use the base class transformation method for consistency
         if self.transforms is not None:
             self.logger.statement("applying feature transforms")
@@ -117,6 +122,41 @@ class Emulator:
 
         return self.data_transformed
 
+
+    def _lowercase_intake(self):
+        """Lowercase all name-keyed state held by the emulator.
+
+        The PEST(++) world (Pst, ins/tpl files, RunStor .rns files) is lowercase,
+        and the runstore forward-run path aligns predict() output columns against
+        the lowercase obs names from the .rns file. If the training data carries
+        original (e.g. upper) case, that alignment silently mis-matches. Lowercasing
+        once here keeps every downstream name (data columns, transform 'columns'
+        lists, predict() output) in the same lowercase namespace.
+        """
+        if self.data is not None:
+            old_cols = list(self.data.columns)
+            new_cols = [str(c).lower() for c in old_cols]
+            if new_cols != old_cols:
+                if len(set(new_cols)) != len(new_cols):
+                    dupes = sorted({c for c in new_cols if new_cols.count(c) > 1})
+                    raise ValueError(
+                        f"lowercasing data column names creates duplicate names: {dupes}")
+                changed = [(o, n) for o, n in zip(old_cols, new_cols) if o != n]
+                if len(changed) <= 5:
+                    detail = ", ".join(f"{o}->{n}" for o, n in changed)
+                else:
+                    examples = ", ".join(f"{o}->{n}" for o, n in changed[:5])
+                    detail = f"{len(changed)} columns, e.g. {examples}"
+                self.logger.warn(f"lowercasing emulator data column names: {detail}")
+                self.data = self.data.copy()
+                self.data.columns = new_cols
+
+        # transform 'columns' lists must track the renamed data columns, or
+        # transform application breaks against the lowercased data
+        if self.transforms is not None:
+            for transform in self.transforms:
+                if isinstance(transform, dict) and transform.get('columns') is not None:
+                    transform['columns'] = [str(c).lower() for c in transform['columns']]
 
     def _fit_transformer_pipeline(self, data=None, transforms=None):
         """

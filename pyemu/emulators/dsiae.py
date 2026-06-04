@@ -124,6 +124,10 @@ class DSIAE(Emulator):
         if data is None:
             raise ValueError("No data stored in the emulator")
 
+        # lowercase all name-keyed state at intake (see Emulator._lowercase_intake)
+        self._lowercase_intake()
+        data = self.data
+
         self.logger.statement("applying feature transforms")
         # Always use the base class transformation method for consistency
         if self.transforms is not None:
@@ -784,12 +788,16 @@ class DSIAE(Emulator):
             df["obgnme"] = "obgnme"
             return df
 
-    def _configure_pst_object(self, pst_obj, pst_original, t_d=None):
+    def _configure_pst_object(self, pst_obj, pst_original=None, observation_data=None, t_d=None):
         """
         Configure DSIAE specific PEST++ options and save dependent files.
         """
         if t_d is None:
              t_d = "."
+
+        # apply the standard handling (pestpp_options/prior_info carry-over,
+        # observation_data updates, noptmax safety) before layering DSIAE specifics
+        super()._configure_pst_object(pst_obj, pst_original, observation_data=observation_data, t_d=t_d)
 
         Z = self.encode(self.data)
         npar = self.latent_dim
