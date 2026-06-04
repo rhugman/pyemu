@@ -1333,5 +1333,646 @@ class TestDSIRunstoreForwardRunOrdering:
                                    expected.loc[:, obs_names].values)
 
 
+# ===========================================================================
+# DSIVC unit tests (binary-free; the inner pestpp-ies run is monkeypatched)
+# ===========================================================================
+#
+# DSIVC composes an outer PESTPP-MOU optimization over a fitted DSI emulator.
+# These tests never invoke a PEST++ binary: prepare_pestpp builds files only,
+# and the one path that would shell out (dsivc_forward_run) is exercised with
+# pyemu.os_utils.run monkeypatched to a no-op (or a writer that fakes the inner
+# IES output files).  All data is tiny synthetic (40 reals x 5 obs).
+#
+# Obs columns deliberately include the colliding prefix pair 'head1'/'head10'
+# to pin metadata-bleed regressions, and are lowercase (the DSI namespace).
+
+
+def _dsivc_synth(seed=1, n_real=40):
+    """Tiny synthetic DSI training data + obs metadata.
+
+    Two weighted columns (history targets) and three zero-weight columns
+    (decision-variable candidates).  Column names include the colliding pair
+    head1/head10 so prefix-collision regressions can be pinned.
+    """
+    cols = ["head1", "head10", "head2", "flow", "base"]
+    np.random.seed(seed)
+    data = pd.DataFrame(np.random.normal(size=(n_real, len(cols))), columns=cols)
+    obsdata = pd.DataFrame(
+        {"obsnme": cols, "obsval": data.mean().values,
+         "weight": [1.0, 1.0, 0.0, 0.0, 0.0], "obgnme": "g"},
+        index=cols,
+    )
+    return data, obsdata, cols
+
+
+def _make_runstore_dsi(tmp_path, seed=1, n_real=40):
+    """Build a fitted DSI and a runstore-prepared DSI template (no binary run).
+
+    Returns (dsi, dsi_t_d, pst, cols).  dsi.prepare_pestpp(use_runstor=True)
+    emits dsi.pst / dsi.pickle / forward_run.py without running anything.
+    """
+    from pyemu.emulators import DSI
+    import pyemu
+
+    data, obsdata, cols = _dsivc_synth(seed=seed, n_real=n_real)
+    dsi = DSI(data=data, pst=obsdata, verbose=False)
+    dsi.fit()
+    dsi_t_d = str(tmp_path / "dsi_t_d")
+    dsi.prepare_pestpp(dsi_t_d, observation_data=obsdata, use_runstor=True)
+    pst = pyemu.Pst(os.path.join(dsi_t_d, "dsi.pst"))
+    return dsi, dsi_t_d, pst, cols
+
+
+def _make_oe(pst, cols, seed=2, n_real=40, columns=None, index=None):
+    """Build an ObservationEnsemble matching the DSI pst (binary-free)."""
+    from pyemu.en import ObservationEnsemble
+    columns = list(cols) if columns is None else list(columns)
+    np.random.seed(seed)
+    df = pd.DataFrame(np.random.normal(size=(n_real, len(columns))), columns=columns)
+    if index is not None:
+        df.index = list(index)
+    return ObservationEnsemble(pst=pst, df=df)
+
+
+def _make_dsivc(tmp_path, seed=1, n_real=40, oe_seed=2):
+    """Build a ready-to-prepare DSIVC over a fresh runstore DSI template."""
+    from pyemu.emulators.dsivc import DSIVC
+
+    dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path, seed=seed, n_real=n_real)
+    oe = _make_oe(pst, cols, seed=oe_seed, n_real=n_real)
+    dv = DSIVC(dsi, dsi_t_d, oe, verbose=False)
+    return dv, dsi, dsi_t_d, pst, cols
+
+
+class TestDSIVCConstruction:
+    """Constructor precondition validation."""
+
+    def test_unfitted_emulator_raises(self, tmp_path):
+        """An unfitted DSI-family emulator is rejected with ValueError."""
+        from pyemu.emulators import DSI
+        from pyemu.emulators.dsivc import DSIVC
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe = _make_oe(pst, cols)
+        data, obsdata, _ = _dsivc_synth()
+        unfitted = DSI(data=data, pst=obsdata, verbose=False)  # no fit()
+        with pytest.raises(ValueError, match="fitted"):
+            DSIVC(unfitted, dsi_t_d, oe)
+
+    @pytest.mark.parametrize("fname", ["dsi.pst", "dsi.pickle", "forward_run.py"])
+    def test_missing_template_file_raises(self, tmp_path, fname):
+        """Deleting any required template file -> FileNotFoundError naming it."""
+        import shutil
+        from pyemu.emulators.dsivc import DSIVC
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe = _make_oe(pst, cols)
+        broken = str(tmp_path / ("broken_" + fname.replace(".", "_")))
+        shutil.copytree(dsi_t_d, broken)
+        os.remove(os.path.join(broken, fname))
+        with pytest.raises(FileNotFoundError, match=fname):
+            DSIVC(dsi, broken, oe)
+
+    def test_non_runstore_forward_run_raises(self, tmp_path):
+        """A file-mode forward_run.py (no runstore target) -> ValueError hint."""
+        import shutil
+        from pyemu.emulators.dsivc import DSIVC
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe = _make_oe(pst, cols)
+        nonrs = str(tmp_path / "nonrs")
+        shutil.copytree(dsi_t_d, nonrs)
+        with open(os.path.join(nonrs, "forward_run.py"), "w") as f:
+            f.write("def dsi_file_forward_run():\n    pass\n")
+        with pytest.raises(ValueError, match="use_runstor=True"):
+            DSIVC(dsi, nonrs, oe)
+
+    def test_oe_not_observation_ensemble_raises(self, tmp_path):
+        """A plain DataFrame for oe -> TypeError mentioning ObservationEnsemble."""
+        from pyemu.emulators.dsivc import DSIVC
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        plain = pd.DataFrame(np.zeros((5, len(cols))), columns=cols)
+        with pytest.raises(TypeError, match="ObservationEnsemble"):
+            DSIVC(dsi, dsi_t_d, plain)
+
+    def test_oe_subset_columns_raises(self, tmp_path):
+        """oe missing a DSI obs column -> ValueError 'match ... exactly'."""
+        from pyemu.emulators.dsivc import DSIVC
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe_sub = _make_oe(pst, cols, columns=cols[:-1])  # drop 'base'
+        with pytest.raises(ValueError, match="match the DSI observation names exactly"):
+            DSIVC(dsi, dsi_t_d, oe_sub)
+
+    def test_oe_extra_column_raises(self, tmp_path):
+        """oe with an extra non-DSI column -> ValueError 'match ... exactly'."""
+        from pyemu.emulators.dsivc import DSIVC
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe_extra = _make_oe(pst, cols, columns=cols + ["bonus"])
+        with pytest.raises(ValueError, match="match the DSI observation names exactly"):
+            DSIVC(dsi, dsi_t_d, oe_extra)
+
+
+class TestDSIVCPrepareValidation:
+    """prepare_pestpp argument validation."""
+
+    def _prep(self, dv, tmp_path, **kwargs):
+        kwargs.setdefault("inner_noptmax", 3)
+        return dv.prepare_pestpp(str(tmp_path / "out"), **kwargs)
+
+    def test_empty_decvars_raises(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match="non-empty"):
+            self._prep(dv, tmp_path, decvar_names=[])
+
+    def test_duplicate_decvars_raises(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match="duplicate"):
+            self._prep(dv, tmp_path, decvar_names=["head2", "head2"])
+
+    def test_weighted_decvar_raises(self, tmp_path):
+        """A history-matching (weighted) obs cannot also be a decvar."""
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match="zero-weight"):
+            self._prep(dv, tmp_path, decvar_names=["head1"])
+
+    def test_decvar_not_in_oe_raises(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match="not found in oe columns"):
+            self._prep(dv, tmp_path, decvar_names=["nope"])
+
+    def test_inner_noptmax_zero_raises(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match="inner_noptmax"):
+            self._prep(dv, tmp_path, decvar_names=["head2"], inner_noptmax=0)
+
+    def test_decvar_weight_zero_raises(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match="decvar_weight"):
+            self._prep(dv, tmp_path, decvar_names=["head2"], decvar_weight=0.0)
+
+    def test_percentiles_empty_raises(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match="percentiles"):
+            self._prep(dv, tmp_path, decvar_names=["head2"], percentiles=[])
+
+    def test_percentiles_out_of_range_raises(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            self._prep(dv, tmp_path, decvar_names=["head2"], percentiles=[1.5])
+
+    def test_t_d_equals_dsi_t_d_raises(self, tmp_path):
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        with pytest.raises(ValueError, match="differ from dsi_t_d"):
+            dv.prepare_pestpp(dsi_t_d, decvar_names=["head2"], inner_noptmax=3)
+
+
+class TestDSIVCPrepareArtifacts:
+    """Artifacts produced by prepare_pestpp: outer pst, inner pst, immutability."""
+
+    def test_outer_pst_loadable_and_pars(self, tmp_path):
+        """dsivc.pst loads; decvar pars are 'none'/group decvars, others fixed;
+        bounds == training min/max, parval1 == training median."""
+        import pyemu
+
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"], inner_noptmax=4)
+
+        op = pyemu.Pst(os.path.join(out, "dsivc.pst"))
+        par = op.parameter_data
+        for dv_name in ("head2", "flow"):
+            assert par.loc[dv_name, "partrans"] == "none"
+            assert par.loc[dv_name, "pargp"] == "decvars"
+            assert np.isclose(float(par.loc[dv_name, "parlbnd"]), dsi.data[dv_name].min())
+            assert np.isclose(float(par.loc[dv_name, "parubnd"]), dsi.data[dv_name].max())
+            assert np.isclose(float(par.loc[dv_name, "parval1"]), dsi.data[dv_name].median())
+        # any non-decvar parameter (none here — only decvars are pars) is fixed;
+        # assert the decvars are the only pars and all obs are zero-weight
+        assert set(op.par_names) == {"head2", "flow"}
+        assert (op.observation_data.weight == 0.0).all()
+
+    def test_stack_stats_metadata_no_prefix_bleed(self, tmp_path):
+        """org_obsnme/stat metadata is correct with colliding prefixes:
+        head1's stats must not bleed into head10's, and NO '_stat:count' obs."""
+        import pyemu
+
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"],
+                          percentiles=[0.5], inner_noptmax=3)
+
+        op = pyemu.Pst(os.path.join(out, "dsivc.pst"))
+        obs = op.observation_data
+        # every stack-stat row's org_obsnme matches the literal prefix it names
+        for name in obs.index:
+            if "_stat:" not in str(name):
+                continue
+            prefix, stat = str(name).rsplit("_stat:", 1)
+            assert obs.loc[name, "org_obsnme"] == prefix
+            assert obs.loc[name, "stat"] == stat
+        # head1 metadata does not appear on any head10 obs and vice versa
+        h1 = obs[obs.org_obsnme == "head1"].index
+        h10 = obs[obs.org_obsnme == "head10"].index
+        assert all(n.startswith("head1_stat:") for n in h1)
+        assert all(n.startswith("head10_stat:") for n in h10)
+        assert len(h1) > 0 and len(h10) > 0
+        # the realization 'count' row is dropped everywhere
+        assert not any("count" in str(n) for n in obs.index)
+        assert not (obs["stat"].astype(str) == "count").any()
+
+    def test_inner_pst_configured(self, tmp_path):
+        """Inner t_d/dsi.pst: decvars weighted, noptmax==inner_noptmax,
+        ies_observation_ensemble==dsi.noise.jcb, ies_num_reals==n_reals."""
+        import pyemu
+
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path, n_real=40)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"], inner_noptmax=5)
+
+        ip = pyemu.Pst(os.path.join(out, "dsi.pst"))
+        assert float(ip.observation_data.loc["head2", "weight"]) == 1.0
+        assert float(ip.observation_data.loc["flow", "weight"]) == 1.0
+        assert ip.control_data.noptmax == 5
+        assert ip.pestpp_options["ies_observation_ensemble"] == "dsi.noise.jcb"
+        assert int(ip.pestpp_options["ies_num_reals"]) == 40
+
+    def test_original_template_immutable(self, tmp_path):
+        """ORIGINAL dsi_t_d/dsi.pst byte-identical before/after prepare, and
+        the t_d copy of dsi.pickle is NOT rewritten (same bytes as dsi_t_d's)."""
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        pst_before = open(os.path.join(dsi_t_d, "dsi.pst"), "rb").read()
+        frun_before = open(os.path.join(dsi_t_d, "forward_run.py"), "rb").read()
+        pkl_before = open(os.path.join(dsi_t_d, "dsi.pickle"), "rb").read()
+
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"], inner_noptmax=3)
+
+        assert open(os.path.join(dsi_t_d, "dsi.pst"), "rb").read() == pst_before
+        assert open(os.path.join(dsi_t_d, "forward_run.py"), "rb").read() == frun_before
+        assert open(os.path.join(dsi_t_d, "dsi.pickle"), "rb").read() == pkl_before
+        # dsi.pickle in t_d is the copied (un-rewritten) artifact
+        assert open(os.path.join(out, "dsi.pickle"), "rb").read() == pkl_before
+
+
+class TestDSIVCNoiseHybrid:
+    """Noise source: draw path (deterministic) vs harvest path (from csv)."""
+
+    def test_draw_path_deterministic(self, tmp_path):
+        """No harvest file -> draw: noise_base.jcb exists; same seed -> identical
+        bytes, different seed -> different bytes."""
+        dv = _make_dsivc(tmp_path)[0]
+        out_a = str(tmp_path / "a")
+        out_b = str(tmp_path / "b")
+        out_c = str(tmp_path / "c")
+        dv.prepare_pestpp(out_a, decvar_names=["head2"], inner_noptmax=3, seed=358)
+        dv.prepare_pestpp(out_b, decvar_names=["head2"], inner_noptmax=3, seed=358)
+        dv.prepare_pestpp(out_c, decvar_names=["head2"], inner_noptmax=3, seed=123)
+
+        na = open(os.path.join(out_a, "dsi.noise_base.jcb"), "rb").read()
+        nb = open(os.path.join(out_b, "dsi.noise_base.jcb"), "rb").read()
+        nc = open(os.path.join(out_c, "dsi.noise_base.jcb"), "rb").read()
+        assert os.path.exists(os.path.join(out_a, "dsi.noise_base.jcb"))
+        assert na == nb
+        assert na != nc
+
+    def test_harvest_path_csv(self, tmp_path):
+        """A dsi.obs+noise.csv in the template -> harvest: n_reals == source rows;
+        inner_num_reals smaller truncates, larger raises."""
+        from pyemu.en import ObservationEnsemble
+        import pyemu
+
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        # hand-written noise source with 25 rows, placed in the template (copied)
+        harvest = ObservationEnsemble(
+            pst=pst, df=pd.DataFrame(np.random.normal(size=(25, len(cols))), columns=cols))
+        harvest.to_csv(os.path.join(dsi_t_d, "dsi.obs+noise.csv"))
+
+        out = str(tmp_path / "harvest")
+        dv.prepare_pestpp(out, decvar_names=["head2"], inner_noptmax=3)
+        ip = pyemu.Pst(os.path.join(out, "dsi.pst"))
+        assert int(ip.pestpp_options["ies_num_reals"]) == 25
+
+        out2 = str(tmp_path / "trunc")
+        dv.prepare_pestpp(out2, decvar_names=["head2"], inner_noptmax=3, inner_num_reals=10)
+        ip2 = pyemu.Pst(os.path.join(out2, "dsi.pst"))
+        assert int(ip2.pestpp_options["ies_num_reals"]) == 10
+
+        with pytest.raises(ValueError, match="exceeds harvested"):
+            dv.prepare_pestpp(str(tmp_path / "toobig"), decvar_names=["head2"],
+                              inner_noptmax=3, inner_num_reals=999)
+
+
+class TestDSIVCGeneratedScript:
+    """The generated dsivc_forward_run.py is a self-contained standalone."""
+
+    def _generate(self, tmp_path):
+        dv = _make_dsivc(tmp_path)[0]
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"],
+                          percentiles=[0.25, 0.5], inner_noptmax=3)
+        return os.path.join(out, "dsivc_forward_run.py")
+
+    def test_four_embedded_top_level_functions(self, tmp_path):
+        """Exactly the 4 embedded functions appear as top-level 'def ' lines
+        (dsivc_forward_run also nests one helper, so total 'def ' is 5)."""
+        src = open(self._generate(tmp_path)).read()
+        top_level = [ln for ln in src.splitlines() if ln.startswith("def ")]
+        assert len(top_level) == 4
+        names = {ln.split("(")[0].replace("def ", "").strip() for ln in top_level}
+        assert names == {"_dsivc_inject_decvars", "_dsivc_stack_stats",
+                         "_dsivc_stack_long", "dsivc_forward_run"}
+
+    def test_no_self_import(self, tmp_path):
+        """The script embeds sources rather than importing the dsivc module."""
+        src = open(self._generate(tmp_path)).read()
+        assert "from pyemu.emulators.dsivc" not in src
+        assert "import pyemu.emulators.dsivc" not in src
+
+    def test_main_call_args(self, tmp_path):
+        """__main__ passes ies_exe_path/percentiles(literal list)/track_stack and
+        does NOT pass inner_noptmax (read from the inner pst at run time)."""
+        src = open(self._generate(tmp_path)).read()
+        call = [ln for ln in src.splitlines()
+                if "dsivc_forward_run(" in ln and "def " not in ln][-1]
+        assert "ies_exe_path=" in call
+        assert "percentiles=[0.25, 0.5]" in call
+        assert "track_stack=" in call
+        assert "inner_noptmax" not in src
+
+    def test_py_compile(self, tmp_path):
+        """The generated script compiles."""
+        import py_compile
+        path = self._generate(tmp_path)
+        py_compile.compile(path, doraise=True)
+
+
+class TestDSIVCInjection:
+    """_dsivc_inject_decvars (f3 regression: Series assignment, pandas>=2 safe)."""
+
+    def test_inject_updates_obsval_and_noise(self, tmp_path):
+        """obsval updated; noise.jcb has decvar columns EXACTLY constant at the
+        targets while other columns are unchanged from noise_base."""
+        from pyemu.emulators.dsivc import _dsivc_inject_decvars
+        from pyemu.en import ObservationEnsemble
+        import pyemu
+
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"], inner_noptmax=3)
+
+        ip = pyemu.Pst(os.path.join(out, "dsi.pst"))
+        base = ObservationEnsemble.from_binary(
+            ip, os.path.join(out, "dsi.noise_base.jcb"))._df.copy()
+
+        decvars = pd.Series({"head2": 1.234, "flow": -5.678})
+        _dsivc_inject_decvars(ip, decvars, ws=out)
+
+        assert float(ip.observation_data.loc["head2", "obsval"]) == 1.234
+        assert float(ip.observation_data.loc["flow", "obsval"]) == -5.678
+
+        noise = ObservationEnsemble.from_binary(
+            ip, os.path.join(out, "dsi.noise.jcb"))._df
+        np.testing.assert_allclose(noise["head2"].values, 1.234)
+        np.testing.assert_allclose(noise["flow"].values, -5.678)
+        # untouched columns identical to the base draw
+        for col in ("head1", "head10", "base"):
+            np.testing.assert_allclose(noise[col].values, base[col].values)
+
+    def test_inject_missing_noise_column_raises(self, tmp_path):
+        """A noise_base lacking a decvar column -> ValueError on injection."""
+        from pyemu.emulators.dsivc import _dsivc_inject_decvars
+        from pyemu.en import ObservationEnsemble
+        import pyemu
+
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"], inner_noptmax=3)
+
+        ip = pyemu.Pst(os.path.join(out, "dsi.pst"))
+        nb = ObservationEnsemble.from_binary(ip, os.path.join(out, "dsi.noise_base.jcb"))
+        doctored = ObservationEnsemble(pst=ip, df=nb._df.drop(columns=["flow"]))
+        doctored.to_binary(os.path.join(out, "dsi.noise_base.jcb"))
+
+        with pytest.raises(ValueError, match="noise ensemble columns"):
+            _dsivc_inject_decvars(ip, pd.Series({"head2": 1.0, "flow": 2.0}), ws=out)
+
+
+class TestDSIVCIterationDiscovery:
+    """dsivc_forward_run discovers the LAST produced iteration from disk
+    (early-termination regression) and cleans stale iteration files first."""
+
+    def _prepare_run_dir(self, tmp_path, inner_noptmax=6):
+        from pyemu.emulators.dsivc import DSIVC
+        import pyemu
+
+        dv, dsi, dsi_t_d, pst, cols = _make_dsivc(tmp_path)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"], inner_noptmax=inner_noptmax)
+        ip = pyemu.Pst(os.path.join(out, "dsi.pst"))
+        n_reals = int(ip.pestpp_options["ies_num_reals"])
+        pd.DataFrame({"parval1": [1.0, 2.0]}, index=["head2", "flow"]).to_csv(
+            os.path.join(out, "dsivc_pars.csv"), index_label="parnme")
+        return out, ip, n_reals, cols
+
+    @staticmethod
+    def _write_iter(out, ip, it, const, n_reals, cols):
+        from pyemu.en import ObservationEnsemble
+        df = pd.DataFrame(float(const), index=range(n_reals), columns=cols)
+        ObservationEnsemble(pst=ip, df=df).to_csv(os.path.join(out, f"dsi.{it}.obs.csv"))
+
+    def test_reads_last_iteration_not_stale(self, tmp_path, monkeypatch):
+        """Pre-place stale dsi.9.obs.csv; the no-op run writes dsi.1.obs.csv;
+        stale is cleaned first, so iteration 1 (not 9) is read."""
+        import pyemu
+        from pyemu.emulators.dsivc import dsivc_forward_run
+
+        out, ip, n_reals, cols = self._prepare_run_dir(tmp_path)
+        self._write_iter(out, ip, 9, 999.0, n_reals, cols)  # stale leftover
+
+        def fake_run(cmd, cwd=None):
+            self._write_iter(cwd, ip, 1, 111.0, n_reals, cols)
+
+        monkeypatch.setattr(pyemu.os_utils, "run", fake_run)
+        dsivc_forward_run(ws=out)
+
+        assert not os.path.exists(os.path.join(out, "dsi.9.obs.csv"))
+        ss = pd.read_csv(os.path.join(out, "dsi.stack_stats.csv"), index_col=0).iloc[:, 0]
+        assert np.isclose(ss.loc["head1_stat:mean"], 111.0)
+
+    def test_picks_highest_of_several_iterations(self, tmp_path, monkeypatch):
+        """With iters 0 and 2 produced (distinct seeded values), iteration 2 wins
+        regardless of the inner noptmax (6)."""
+        import pyemu
+        from pyemu.emulators.dsivc import dsivc_forward_run
+
+        out, ip, n_reals, cols = self._prepare_run_dir(tmp_path, inner_noptmax=6)
+
+        def fake_run(cmd, cwd=None):
+            self._write_iter(cwd, ip, 0, 100.0, n_reals, cols)
+            self._write_iter(cwd, ip, 2, 222.0, n_reals, cols)
+
+        monkeypatch.setattr(pyemu.os_utils, "run", fake_run)
+        dsivc_forward_run(ws=out)
+        ss = pd.read_csv(os.path.join(out, "dsi.stack_stats.csv"), index_col=0).iloc[:, 0]
+        assert np.isclose(ss.loc["head1_stat:mean"], 222.0)
+
+    def test_only_iteration_zero_raises(self, tmp_path, monkeypatch):
+        """A run that produces nothing past iteration 0 -> FileNotFoundError."""
+        import pyemu
+        from pyemu.emulators.dsivc import dsivc_forward_run
+
+        out, ip, n_reals, cols = self._prepare_run_dir(tmp_path)
+
+        def fake_run(cmd, cwd=None):
+            self._write_iter(cwd, ip, 0, 100.0, n_reals, cols)
+
+        monkeypatch.setattr(pyemu.os_utils, "run", fake_run)
+        with pytest.raises(FileNotFoundError, match="inner IES run failed"):
+            dsivc_forward_run(ws=out)
+
+
+class TestDSIVCPositionalStack:
+    """Per-realization stack obs are POSITIONAL (f10 regression)."""
+
+    def test_stack_long_positional_names(self, tmp_path):
+        """_dsivc_stack_long on weird string row labels -> col_real:0..n-1 names,
+        no label leakage."""
+        from pyemu.emulators.dsivc import _dsivc_stack_long
+
+        df = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [4.0, 5.0, 6.0]},
+                          index=["xx", "yy", "zz"])
+        s = _dsivc_stack_long(df)
+        assert set(s.index) == {"a_real:0", "a_real:1", "a_real:2",
+                                "b_real:0", "b_real:1", "b_real:2"}
+        assert not any(lbl in str(n) for n in s.index for lbl in ("xx", "yy", "zz"))
+        assert s.loc["a_real:0"] == 1.0
+        assert s.loc["b_real:2"] == 6.0
+
+    def test_track_stack_positional_obs(self, tmp_path):
+        """track_stack=True with string-labeled oe -> positional stack obs;
+        count == ncols * n_reals."""
+        import pyemu
+        from pyemu.emulators.dsivc import DSIVC
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe = _make_oe(pst, cols, index=[f"r{i}" for i in range(40)])
+        dv = DSIVC(dsi, dsi_t_d, oe, verbose=False)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"],
+                          percentiles=[0.5], track_stack=True, inner_noptmax=3)
+
+        op = pyemu.Pst(os.path.join(out, "dsivc.pst"))
+        stack = [n for n in op.obs_names if "_real:" in n]
+        assert len(stack) == len(cols) * 40
+        assert not any("_real:r" in n for n in stack)  # no label leak
+
+    def test_track_stack_pad_path(self, tmp_path):
+        """oe rows < n_reals (harvest with more rows) -> stack padded to
+        ncols * n_reals positions."""
+        import pyemu
+        from pyemu.emulators.dsivc import DSIVC
+        from pyemu.en import ObservationEnsemble
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe = _make_oe(pst, cols, n_real=40)
+        # harvest source with 60 rows -> n_reals 60 > oe's 40 -> pad
+        harvest = ObservationEnsemble(
+            pst=pst, df=pd.DataFrame(np.random.normal(size=(60, len(cols))), columns=cols))
+        harvest.to_csv(os.path.join(dsi_t_d, "dsi.obs+noise.csv"))
+        dv = DSIVC(dsi, dsi_t_d, oe, verbose=False)
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2"], percentiles=[0.5],
+                          track_stack=True, inner_noptmax=3)
+
+        op = pyemu.Pst(os.path.join(out, "dsivc.pst"))
+        ip = pyemu.Pst(os.path.join(out, "dsi.pst"))
+        n_reals = int(ip.pestpp_options["ies_num_reals"])
+        assert n_reals == 60
+        stack = [n for n in op.obs_names if "_real:" in n]
+        assert len(stack) == len(cols) * 60
+
+
+class TestDSIVCCanonicalOrder:
+    """Stack-stats are summarized in pst.obs_names order, not oe-column order."""
+
+    def test_shuffled_oe_columns_map_to_right_names(self, tmp_path):
+        """oe columns shuffled vs pst.obs_names, each a distinct constant ->
+        each obs's stack-stats match its own column's constant."""
+        import pyemu
+        from pyemu.emulators.dsivc import DSIVC
+        from pyemu.en import ObservationEnsemble
+
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        const = {"head1": 11.0, "head10": 22.0, "head2": 33.0, "flow": 44.0, "base": 55.0}
+        shuffled = ["flow", "head1", "base", "head10", "head2"]  # != pst.obs_names
+        oe_df = pd.DataFrame({c: [const[c]] * 40 for c in shuffled})
+        oe = ObservationEnsemble(pst=pst, df=oe_df)
+        dv = DSIVC(dsi, dsi_t_d, oe, verbose=False)
+
+        out = str(tmp_path / "out")
+        dv.prepare_pestpp(out, decvar_names=["head2", "flow"],
+                          percentiles=[0.5], inner_noptmax=3)
+
+        ss = pd.read_csv(os.path.join(out, "dsi.stack_stats.csv"), index_col=0).iloc[:, 0]
+        for col, val in const.items():
+            assert np.isclose(ss.loc[f"{col}_stat:mean"], val), col
+            assert np.isclose(ss.loc[f"{col}_stat:50%"], val), col
+
+        # The ins read is POSITIONAL: dsi.stack_stats.csv rows ARE the prepare-time
+        # ins enumeration order, and the run-time forward run reindexes its
+        # posterior to pst.obs_names before writing in this same order.  So the
+        # stack-stats file must be summarized in canonical pst.obs_names order,
+        # NOT the shuffled oe-column order (this is what the reindex guarantees).
+        org_order = list(dict.fromkeys(
+            str(n).rsplit("_stat:", 1)[0] for n in ss.index))
+        assert org_order == list(pst.obs_names), (org_order, list(pst.obs_names))
+        assert org_order != shuffled
+
+
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
+class TestDSIVCOverDSIAE:
+    """DSIVC is emulator-agnostic: it consumes only emulator.fitted and
+    emulator.data, so a fitted DSIAE composes the same as a DSI.
+
+    Prepare-level only (no binary run): a full DSIAE runstore template via
+    DSIAE.prepare_pestpp is still blocked by parked DSIAE defects, so the
+    template here is DSI-produced over the same training data."""
+
+    def test_dsiae_prepare_pestpp(self, tmp_path):
+        from pyemu.emulators import DSIAE
+        from pyemu.emulators.dsivc import DSIVC
+
+        # runstore template + matching oe (DSI-produced, same data/obs names)
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+        oe = _make_oe(pst, cols)
+
+        # no pst: DSIAE.__init__ can't take a DataFrame pst (parked defect) and
+        # DSIVC consumes only emulator.fitted + emulator.data anyway
+        data, _, _ = _dsivc_synth()
+        dsiae = DSIAE(data=data, latent_dim=2, verbose=False)
+        dsiae.fit(epochs=2)
+
+        dv = DSIVC(emulator=dsiae, dsi_t_d=dsi_t_d, oe=oe, verbose=False)
+        out = str(tmp_path / "out_dsiae")
+        pstv = dv.prepare_pestpp(out, decvar_names=["head2", "flow"],
+                                 percentiles=[0.5], inner_noptmax=2)
+
+        # artifacts present; decvar bounds/initials come from the DSIAE's
+        # training data (the emulator side of the composition)
+        for fname in ("dsivc.pst", "dsivc_pars.csv", "dsivc_pars.csv.tpl",
+                      "dsi.stack_stats.csv", "dsi.noise_base.jcb",
+                      "dsivc_forward_run.py", "initial_dvpop.jcb"):
+            assert os.path.exists(os.path.join(out, fname)), fname
+        par = pstv.parameter_data
+        for dv_name in ("head2", "flow"):
+            assert np.isclose(float(par.loc[dv_name, "parval1"]),
+                              float(dsiae.data[dv_name].median()))
+            assert np.isclose(float(par.loc[dv_name, "parlbnd"]),
+                              float(dsiae.data[dv_name].min()))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

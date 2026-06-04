@@ -166,72 +166,150 @@ def test_generic_transformer(tmp_path):
     dsi_synth(tmp_path, transforms=transforms, tag="_quantile")
     return
 
-@pytest.mark.skip(reason="still in dev")
-#@pytest.mark.timeout(method="thread", timeout=1000)
 def test_dsivc(tmp_path):
+    """End-to-end DSIVC: a fitted correlated DSI -> runstore-prepared dsi.pst ->
+    seeded inner IES (pestpp-ies /e) -> DSIVC outer interface -> a REAL pestpp-mou
+    optimization (run serially; each model run is the generated
+    dsivc_forward_run.py which runs the nested inner IES).
+
+    The synthetic data is driven by a single common factor + small noise, so all
+    DSI observations are strongly positively correlated.  Decision variables are
+    two zero-weight DSI observations; the MINIMIZE objective is the median
+    stack-stat of a NON-decvar output (obs2).  Because everything tracks the
+    common factor, pushing the decvars down pushes the objective down, so the
+    optimizer must drive the decvar population toward smaller values.
+    """
+    from pyemu.emulators import DSIVC
+
     tmp_path = Path(tmp_path)
-    # basic quick as so can re-run here
-    dsi_synth(tmp_path, transforms=None, use_runstor=True)
-    # now test dsicv
-    # master_dsi should now exist
 
-    md_hm = tmp_path / "template_dsi"
-    # print(os.listdir('.'))
-    assert os.path.exists(md_hm), f"Master directory {md_hm} does not exist."
-    td = tmp_path / "template_dsivc"
-    if os.path.exists(td):
-        shutil.rmtree(td)
-    shutil.copytree(md_hm, td)
+    # --- 1. correlated synthetic data ------------------------------------
+    # one common factor z + small per-column noise => all obs positively
+    # correlated; uniform-ish positive values; lowercase names.
+    rng = np.random.RandomState(123)
+    n_real, n_obs = 80, 6
+    z = rng.uniform(2.0, 9.0, size=(n_real, 1))
+    data = pd.DataFrame(
+        np.hstack([z + 0.1 * rng.normal(size=(n_real, 1)) for _ in range(n_obs)]),
+        columns=[f"obs{i}" for i in range(n_obs)],
+    )
+    obsdata = pd.DataFrame(
+        {"obsnme": data.columns, "obsval": data.mean().values,
+         "weight": 0.0, "obgnme": "obgnme"},
+        index=data.columns,
+    )
+    obsdata.loc[["obs0", "obs1"], "weight"] = 1.0  # 2 weighted history obs
 
-    dsi = DSI.load(os.path.join(td, "dsi.pickle"))
+    # --- 2. fit DSI, prepare runstore interface, seed the inner IES ------
+    dsi = DSI(data=data, pst=obsdata, verbose=False)
+    dsi.fit()
+    td = tmp_path / "template_dsi"
+    pstdsi = dsi.prepare_pestpp(td, observation_data=obsdata, use_runstor=True)
+    pstdsi.control_data.noptmax = 1
+    pstdsi.pestpp_options["ies_num_reals"] = 30
+    pstdsi.write(os.path.join(td, "dsi.pst"), version=2)
 
-    pst = pyemu.Pst(os.path.join(td, "dsi.pst"))
-    try:
-        oe = pyemu.ObservationEnsemble.from_binary(pst=pst, filename=os.path.join(td, "dsi.0.obs.jcb"))
-    except:
-        oe = pyemu.ObservationEnsemble.from_csv(pst=pst, filename=os.path.join(td, "dsi.0.obs.csv"))
+    pyemu.os_utils.run(f"{ies_exe_path} dsi.pst /e", cwd=td)
+    pst_dsi = pyemu.Pst(os.path.join(td, "dsi.pst"))
+    post = os.path.join(td, "dsi.1.obs.jcb")
+    if os.path.exists(post):
+        oe = pyemu.ObservationEnsemble.from_binary(pst=pst_dsi, filename=post)
+    else:
+        oe = pyemu.ObservationEnsemble.from_csv(
+            pst=pst_dsi, filename=os.path.join(td, "dsi.1.obs.csv"))
 
-    obsdata = dsi.observation_data
-    decvars = obsdata.obsnme.tolist()[:-2]
-    pstdsivc = dsi.prepare_dsivc(t_d=td,
-                                oe=oe,
-                                decvar_names=decvars,
-                                track_stack=False,
-                                percentiles=[0.05,0.5,0.95],
-                                dsi_args={
-                                    "noptmax":1, #just for testing
-                                    "decvar_weight":10.0,
-                                    "num_pyworkers":1,
-                                },
-                                ies_exe_path=ies_exe_path,
-                                )
+    # --- 3. build the DSIVC outer interface ------------------------------
+    decvar_names = ["obs4", "obs5"]
+    dsivc = DSIVC(emulator=dsi, dsi_t_d=str(td), oe=oe)
+    td2 = tmp_path / "template_dsivc"
+    pstv = dsivc.prepare_pestpp(
+        str(td2), decvar_names=decvar_names,
+        percentiles=[0.05, 0.5, 0.95], inner_noptmax=1,
+        decvar_weight=100.0, mou_population_size=6, seed=358,
+        ies_exe_path=ies_exe_path,
+    )
 
-    obs = pstdsivc.observation_data
-    obs.org_obsnme.unique()
+    # --- 4. single MINIMIZE objective on a non-decvar stack-stat ---------
+    obj = "obs2_stat:50%"  # obs2 is NOT a decvar but tracks the common factor
+    obs = pstv.observation_data
+    assert obj in obs.index, f"{obj} not in stack-stats: {list(obs.index)}"
+    pstv.pestpp_options["mou_objectives"] = obj
+    obs.loc[obj, "weight"] = 1.0
+    obs.loc[obj, "obgnme"] = "less_than_obj"
 
-    obsnme = obsdata.obsnme.tolist()[0]
-    mou_objectives = obs.loc[(obs.org_obsnme==obsnme) & (obs.stat=="50%")].obsnme.tolist()
+    pstv.control_data.noptmax = 2  # two generations
+    pstv.pestpp_options["mou_population_size"] = 6
+    pstv.write(os.path.join(td2, "dsivc.pst"), version=2)
 
-    pstdsivc.pestpp_options["mou_objectives"] = mou_objectives
-    obs.loc[mou_objectives, "weight"] = 1.0
-    obs.loc[mou_objectives, "obgnme"] = "less_than_obj"
+    # --- 5. run pestpp-mou SERIALLY (no workers/ports) -------------------
+    # each model run is `python dsivc_forward_run.py`, which itself runs the
+    # nested `pestpp-ies dsi.pst /e` conditioning in a single process.
+    pyemu.os_utils.run(f"{mou_exe_path} dsivc.pst", cwd=td2)
 
-    pstdsivc.control_data.noptmax = 1 #just for testing
-    pstdsivc.pestpp_options["mou_population_size"] = 20 #just for testing 
+    # --- 6. assertions ---------------------------------------------------
+    def _dv_pop(gen):
+        return pd.read_csv(os.path.join(td2, f"dsivc.{gen}.dv_pop.csv"),
+                           index_col=0)
 
-    pstdsivc.write(os.path.join(td, "dsivc.pst"),version=2)
+    def _obs_pop(gen):
+        return pd.read_csv(os.path.join(td2, f"dsivc.{gen}.obs_pop.csv"),
+                           index_col=0)
 
-    md = tmp_path / "master_dsivc"
-    num_workers =  pstdsivc.pestpp_options["mou_population_size"]
-    worker_root = tmp_path
+    # (a) MOU produced generation outputs for gens 0..2
+    for gen in (0, 1, 2):
+        assert os.path.exists(os.path.join(td2, f"dsivc.{gen}.dv_pop.csv")), \
+            f"missing dv_pop for generation {gen}"
+        assert os.path.exists(os.path.join(td2, f"dsivc.{gen}.obs_pop.csv")), \
+            f"missing obs_pop for generation {gen}"
 
-    pyemu.os_utils.start_workers(td,
-                                 mou_exe_path,
-                                    "dsivc.pst",
-                                    num_workers=num_workers,
-                                    worker_root=worker_root,
-                                    master_dir=md,
-                                    port=_get_port(),)
+    dv_init, dv_final = _dv_pop(0), _dv_pop(2)
+    obs_init, obs_final = _obs_pop(0), _obs_pop(2)
+
+    # (b) the objective responds to decvars: finite and non-constant across
+    # the final-generation population members.
+    obj_final = obs_final[obj].values
+    assert np.all(np.isfinite(obj_final)), f"non-finite objective: {obj_final}"
+    assert np.ptp(obj_final) > 0.0, \
+        f"objective is constant across final population: {obj_final}"
+
+    # (c) decvars MOVED toward the objective: minimizing a positively
+    # correlated objective => the final decvar population mean is LOWER than
+    # the initial one.  (Deterministic with seed=358; observed margin ~1.7.)
+    dv_mean_init = float(dv_init[decvar_names].values.mean())
+    dv_mean_final = float(dv_final[decvar_names].values.mean())
+    assert dv_mean_final < dv_mean_init, \
+        f"decvar mean did not decrease: init {dv_mean_init} -> final {dv_mean_final}"
+    # the objective mean must also have improved (decreased)
+    assert float(obs_final[obj].mean()) < float(obs_init[obj].mean()), \
+        "objective mean did not improve across generations"
+
+    # (d) the inner conditioning happened: rerun the generated runner once
+    # with KNOWN decvar targets and assert the conditioned posterior decvar
+    # means land near those targets.
+    targets = {"obs4": 7.5, "obs5": 7.5}
+    pars = pd.read_csv(os.path.join(td2, "dsivc_pars.csv"), index_col=0)
+    for k, v in targets.items():
+        pars.loc[k, "parval1"] = v
+    pars.to_csv(os.path.join(td2, "dsivc_pars.csv"))
+    pyemu.os_utils.run("python dsivc_forward_run.py", cwd=td2)
+
+    iters = sorted({int(f.split(".")[1]) for f in os.listdir(td2)
+                    if f.startswith("dsi.") and ".obs." in f
+                    and f.split(".")[1].isdigit()})
+    assert max(iters) >= 1, f"inner IES did not condition (iterations: {iters})"
+    last = max(iters)
+    pst_inner = pyemu.Pst(os.path.join(td2, "dsi.pst"))
+    jcb = os.path.join(td2, f"dsi.{last}.obs.jcb")
+    if os.path.exists(jcb):
+        post2 = pyemu.ObservationEnsemble.from_binary(pst=pst_inner, filename=jcb)
+    else:
+        post2 = pyemu.ObservationEnsemble.from_csv(
+            pst=pst_inner, filename=os.path.join(td2, f"dsi.{last}.obs.csv"))
+    for c, tgt in targets.items():
+        post_mean = float(post2._df[c].mean())
+        assert abs(post_mean - tgt) < 0.2, \
+            f"conditioning {c}: target {tgt}, posterior mean {post_mean}"
+    return
 
 
 
