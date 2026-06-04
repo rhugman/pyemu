@@ -930,6 +930,62 @@ def test_gpr_runstor(tmp_path):
     assert "pst_name='my_chk_pstname'" in content
 
 
+def test_gpr_runstor_output_file_parses(tmp_path):
+    """Regression test: with use_runstor=True the bootstrap output file
+    (emulator_output.csv) must be parseable by its own instruction file.
+    Previously _write_output_file wrote two rows per output (value then std)
+    while the instruction file expects one line with value and std together,
+    so Pst.from_io_files swallowed a UserWarning and parsing failed."""
+    import warnings
+    import pyemu
+    from pyemu.emulators import GPR
+    from pyemu.pst.pst_utils import InstructionFile
+
+    # 1. Create Data
+    x = np.linspace(0.0, 10.0, 20)
+    y = 2.0 * x + 1.0
+    df = pd.DataFrame({'x': x, 'y': y})
+
+    # 2. Init (no optimizer restarts for speed/determinism)
+    gpr = GPR(data=df, input_names=['x'], output_names=['y'],
+              n_restarts_optimizer=0, verbose=False)
+    gpr.fit()
+
+    # 3. Dummy Pst with par 'x' and obs 'y' (obsval 11.0)
+    pst = pyemu.Pst("dummy.pst", load=False)
+    pst.parameter_data = pd.DataFrame(
+        {'parnme':['x'], 'parval1':[5.0], 'parlbnd':[0.0], 'parubnd':[10.0],
+         'pargp':['pargp'], 'scale':[1.0], 'offset':[0.0], 'partrans':['none']},
+        index=['x']
+    )
+    pst.observation_data = pd.DataFrame(
+        {'obsnme':['y'], 'obsval':[11.0], 'weight':[1.0], 'obgnme':['obgnme']},
+        index=['y']
+    )
+
+    # 4. Prepare PEST++ (RunStor) with the formerly-swallowed parse warning
+    # promoted to a hard error.
+    t_d = str(tmp_path / "gpr_runstor_parse_template")
+    if os.path.exists(t_d):
+        shutil.rmtree(t_d)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        gpr.prepare_pestpp(t_d, pst=pst, use_runstor=True)
+
+    # 5. The bootstrap output file must parse through its own instruction file.
+    out = os.path.join(t_d, "emulator_output.csv")
+    ins = os.path.join(t_d, "emulator_output.csv.ins")
+    assert os.path.exists(out)
+    assert os.path.exists(ins)
+
+    res_df = InstructionFile(ins).read_output_file(out)
+    assert 'y' in res_df.index
+    assert 'y_gprstd' in res_df.index
+    assert np.isclose(res_df.loc['y', 'obsval'], 11.0)
+    assert np.isclose(res_df.loc['y_gprstd', 'obsval'], 0.0)
+
+
 def test_row_wise_minmax_scaler():
     from pyemu.emulators.transformers import RowWiseMinMaxScaler
     

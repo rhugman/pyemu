@@ -443,16 +443,20 @@ class GPR(Emulator):
         return super().prepare_pestpp(t_d, pst=pst, verbose=verbose, **kwargs)
     
     def _write_output_file(self, obs_df, filename):
-        """Writes GPR-specific output file (handling std dev)."""
+        """Writes GPR-specific output file, mirroring gpr_file_forward_run's
+        runtime format: one line per output, with the std on the same line
+        when return_std is True (matching _write_instruction_file)."""
         with open(filename, 'w') as f:
-            f.write("obsnme,obsval\n") # header
-            for output_name in self.output_names:
-                if self.return_std:
-                    # e.g. "obsnme, val, std"
-                    f.write(f"{output_name},0.0\n")
-                    f.write(f"{output_name}_gprstd,0.0\n")
-                else:
-                    f.write(f"{output_name},0.0\n")
+            if self.return_std:
+                f.write("obsnme,obsval,obsstd\n")
+                for output_name in self.output_names:
+                    val = obs_df.loc[output_name, "obsval"]
+                    std = obs_df.loc[f"{output_name}_gprstd", "obsval"]
+                    f.write(f"{output_name},{val},{std}\n")
+            else:
+                f.write("obsnme,obsval\n")
+                for output_name in self.output_names:
+                    f.write(f"{output_name},{obs_df.loc[output_name, 'obsval']}\n")
 
     def _write_instruction_file(self, obs_df, filename):
         """Writes GPR-specific instruction file (handling std dev)."""
