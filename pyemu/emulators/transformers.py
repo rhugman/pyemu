@@ -471,14 +471,20 @@ class NormalScoreTransformer(BaseTransformer):
     max_samples : int, optional
         Deprecated, no effect. Retained for backward compatibility with the
         former Monte-Carlo z-score routine.
-    quadratic_extrapolation : bool, default=False
-        If True, values outside the fitted range are mapped with a monotone
-        quadratic curve fitted through the three boundary knots of each tail
-        (analytically inverted, so transform and inverse_transform remain
-        exact inverses in the tails). If False (default), out-of-range values
-        are clamped to the boundary z-score / original value.
+    quadratic_extrapolation : bool, optional
+        Deprecated alias for ``extrapolation``: True maps to "quadratic",
+        False (the default) to "clamp". Ignored when ``extrapolation`` is
+        given.
     columns : list, optional
         List of column names to be transformed. If None, all columns will be transformed.
+    extrapolation : {"clamp", "linear", "quadratic"}, optional
+        How to map values outside the fitted range. "clamp" (default) pins
+        them to the boundary z-score / original value. "linear" extrapolates
+        with the mean slope through the boundary knot and the two nearest
+        knots with genuinely distinct values. "quadratic" fits a monotone
+        quadratic curve through the same knots; the curve is analytically
+        inverted, so transform and inverse_transform remain exact inverses in
+        the tails.
 
     Notes
     -----
@@ -489,12 +495,28 @@ class NormalScoreTransformer(BaseTransformer):
     deterministic: fitting consumes no random numbers.
     """
 
-    def __init__(self, tol=1e-7, max_samples=1000000, quadratic_extrapolation=False, columns=None):
+    def __init__(self, tol=1e-7, max_samples=1000000, quadratic_extrapolation=False,
+                 columns=None, extrapolation=None):
+        if extrapolation is not None and extrapolation not in ("clamp", "linear", "quadratic"):
+            raise ValueError(
+                "extrapolation must be one of 'clamp', 'linear', 'quadratic', "
+                f"got {extrapolation!r}"
+            )
         self.tol = tol  # deprecated, unused
         self.max_samples = max_samples  # deprecated, unused
-        self.quadratic_extrapolation = quadratic_extrapolation
+        self.quadratic_extrapolation = quadratic_extrapolation  # deprecated alias
+        self.extrapolation = extrapolation if extrapolation is not None else (
+            "quadratic" if quadratic_extrapolation else "clamp")
         self.columns = columns
         self.column_parameters = {}
+
+    def _extrapolation_mode(self):
+        """Resolve the tail mode; instances pickled before the ``extrapolation``
+        parameter existed fall back to the deprecated boolean."""
+        mode = getattr(self, "extrapolation", None)
+        if mode is None:
+            mode = "quadratic" if self.quadratic_extrapolation else "clamp"
+        return mode
 
     def fit(self, X):
         """Fit the transformer to the data."""
@@ -528,7 +550,7 @@ class NormalScoreTransformer(BaseTransformer):
         return norm.ppf((i - 0.375) / (n + 0.25))
 
     @staticmethod
-    def _tail_coefficients(originals, z_scores):
+    def _tail_coefficients(originals, z_scores, linear=False):
         """Monotone quadratic tail curves for extrapolation beyond the fitted knots.
 
         Each tail is a parabola in z, ``o(z_b + t) = o_b + b*t + a*t**2`` with
@@ -540,6 +562,10 @@ class NormalScoreTransformer(BaseTransformer):
         Coefficients are constrained so each curve is strictly increasing on
         its extrapolation side (vertex outside the domain), falling back to
         the chosen knots' mean slope otherwise.
+
+        With ``linear=True`` the quadratic term is dropped: each tail is a line
+        through the boundary knot with the mean slope of the picked knots
+        (``a = 0``), using the same tie-robust knot selection.
 
         Returns ``((a_lo, b_lo), (a_hi, b_hi))``; a tail entry is None when
         that tail has no informative variation (callers should clamp). Returns
@@ -564,8 +590,8 @@ class NormalScoreTransformer(BaseTransformer):
                         break
             if len(picked) < 2:
                 return None  # no informative variation on this tail
-            if len(picked) == 2:
-                s = (o[picked[1]] - o[ib]) / (z[picked[1]] - z[ib])
+            if len(picked) == 2 or linear:
+                s = (o[picked[-1]] - o[ib]) / (z[picked[-1]] - z[ib])
                 return 0.0, s
             # order the three knots by ascending z; boundary is z1 (lower tail)
             # or z3 (upper tail)
@@ -629,9 +655,10 @@ class NormalScoreTransformer(BaseTransformer):
             below_min = values < min_orig
             above_max = values > max_orig
 
+            mode = self._extrapolation_mode()
             tails = None
-            if self.quadratic_extrapolation and (below_min.any() or above_max.any()):
-                tails = self._tail_coefficients(originals, z_scores)
+            if mode != "clamp" and (below_min.any() or above_max.any()):
+                tails = self._tail_coefficients(originals, z_scores, linear=(mode == "linear"))
 
             if below_min.any():
                 if tails is not None and tails[0] is not None:
@@ -692,9 +719,10 @@ class NormalScoreTransformer(BaseTransformer):
             below_min = values < min_z
             above_max = values > max_z
 
+            mode = self._extrapolation_mode()
             tails = None
-            if self.quadratic_extrapolation and (below_min.any() or above_max.any()):
-                tails = self._tail_coefficients(originals, z_scores)
+            if mode != "clamp" and (below_min.any() or above_max.any()):
+                tails = self._tail_coefficients(originals, z_scores, linear=(mode == "linear"))
 
             if below_min.any():
                 if tails is not None and tails[0] is not None:

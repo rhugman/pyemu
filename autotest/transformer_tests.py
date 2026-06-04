@@ -915,3 +915,146 @@ def test_normal_score_clamp_false_unchanged():
     inv = nst.inverse_transform(pd.DataFrame({col: [min_z - 5.0, max_z + 5.0]}))[col].values
     assert inv[0] == min_orig
     assert inv[1] == max_orig
+
+
+# ---------------------------------------------------------------------------
+# Linear-extrapolation tail tests, the extrapolation/quadratic_extrapolation
+# alias mapping, invalid-value handling, config wiring, and pre-feature pickle
+# compatibility for the new ``extrapolation`` parameter.
+# ---------------------------------------------------------------------------
+
+def test_normal_score_linear_tail_straight_roundtrip_and_finite():
+    """(a) linear mode: each tail is a straight line (zero second difference of
+    the inverse on a z-grid beyond the max), round-trips exactly in BOTH tails,
+    and the forward transform across the boundary is monotone and finite."""
+    col = 'c'
+    df = _curved_frame(col)
+
+    nst = pyemu.emulators.NormalScoreTransformer(extrapolation="linear")
+    nst.fit(df)
+    assert nst.extrapolation == "linear"
+
+    originals = np.asarray(nst.column_parameters[col]['originals'])
+    z_scores = np.asarray(nst.column_parameters[col]['z_scores'])
+    min_orig, max_orig = originals.min(), originals.max()
+    max_z = z_scores.max()
+    span = max_orig - min_orig
+
+    # inverse over a uniform z-grid beyond the max z must be straight: the
+    # second difference of a line is zero (contrast the quadratic tail test).
+    z_grid = max_z + np.linspace(0.2, 2.0, 9)
+    inv = nst.inverse_transform(pd.DataFrame({col: z_grid}))[col].values
+    second_diff = np.diff(inv, 2)
+    np.testing.assert_allclose(second_diff, 0.0, atol=1e-8)
+
+    # exact round-trip in both tails
+    below = np.array([min_orig - 0.05 * span, min_orig - 0.5 * span, min_orig - span])
+    above = np.array([max_orig + 0.05 * span, max_orig + 0.5 * span, max_orig + span])
+    probe = pd.DataFrame({col: np.concatenate([below, above])})
+    round_trip = nst.inverse_transform(nst.transform(probe))
+    np.testing.assert_allclose(round_trip[col].values, probe[col].values, rtol=1e-9, atol=1e-9)
+
+    # monotone and finite across the boundary on a fine grid
+    grid = np.linspace(min_orig - 2.0, max_orig + 2.0, 500)
+    z = nst.transform(pd.DataFrame({col: grid}))[col].values
+    assert np.all(np.isfinite(z))
+    assert np.all(np.diff(z) > 0)
+
+
+def test_normal_score_linear_tail_tie_robust():
+    """(a) linear mode is tie-robust: on the tied-end dataset
+    linspace(1, 99, 32) + 8x100.0 the adaptive knot selection skips the tied
+    knots, so transform(100.5) is a small z in (2, 10) (a degenerate end-pair
+    slope would blow this up)."""
+    col = 't'
+    df = pd.DataFrame({col: np.concatenate([np.linspace(1, 99, 32), np.full(8, 100.0)])})
+
+    nst = pyemu.emulators.NormalScoreTransformer(extrapolation="linear")
+    nst.fit(df)
+
+    z = nst.transform(pd.DataFrame({col: [100.5]}))[col].values[0]
+    assert 2.0 < z < 10.0, f"tied-end linear transform(100.5) = {z}, expected in (2, 10)"
+
+
+def test_normal_score_extrapolation_alias_mapping():
+    """(b) the deprecated boolean maps onto the resolved .extrapolation, and an
+    explicit extrapolation overrides it:
+      - quadratic_extrapolation=True  -> .extrapolation == "quadratic", curved tails
+      - default                       -> .extrapolation == "clamp", out-of-range clamps
+      - extrapolation="clamp" + quadratic_extrapolation=True -> "clamp" wins
+    """
+    col = 'c'
+    df = _curved_frame(col)
+
+    # quadratic_extrapolation=True maps to "quadratic" with curved tails
+    nst_quad = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    nst_quad.fit(df)
+    assert nst_quad.extrapolation == "quadratic"
+    z_scores = np.asarray(nst_quad.column_parameters[col]['z_scores'])
+    max_z = z_scores.max()
+    z_grid = max_z + np.linspace(0.2, 2.0, 9)
+    inv = nst_quad.inverse_transform(pd.DataFrame({col: z_grid}))[col].values
+    assert np.max(np.abs(np.diff(inv, 2))) > 1e-8, "quadratic alias did not produce curved tails"
+
+    # default maps to "clamp" and out-of-range values clamp to the boundary
+    nst_def = pyemu.emulators.NormalScoreTransformer()
+    nst_def.fit(df)
+    assert nst_def.extrapolation == "clamp"
+    originals = np.asarray(nst_def.column_parameters[col]['originals'])
+    min_orig, max_orig = originals.min(), originals.max()
+    zs = np.asarray(nst_def.column_parameters[col]['z_scores'])
+    min_z, max_z = zs.min(), zs.max()
+    span = max_orig - min_orig
+    fwd = nst_def.transform(pd.DataFrame({col: [min_orig - span, max_orig + span]}))[col].values
+    assert fwd[0] == min_z
+    assert fwd[1] == max_z
+
+    # explicit extrapolation wins over the deprecated boolean
+    nst_override = pyemu.emulators.NormalScoreTransformer(
+        extrapolation="clamp", quadratic_extrapolation=True)
+    assert nst_override.extrapolation == "clamp"
+
+
+def test_normal_score_invalid_extrapolation_raises():
+    """(c) an invalid extrapolation value raises ValueError at construction."""
+    with pytest.raises(ValueError):
+        pyemu.emulators.NormalScoreTransformer(extrapolation="cubic")
+
+
+def test_normal_score_autobots_apply_passes_extrapolation():
+    """(d) config wiring: AutobotsAssemble(df).apply("normal_score",
+    extrapolation="linear") stores a NormalScoreTransformer whose
+    .extrapolation == "linear"."""
+    col = 'c'
+    df = _curved_frame(col)
+
+    aa = pyemu.emulators.AutobotsAssemble(df)
+    aa.apply("normal_score", extrapolation="linear")
+
+    transformer = aa.pipeline.transformers[0][0]
+    assert isinstance(transformer, pyemu.emulators.NormalScoreTransformer)
+    assert transformer.extrapolation == "linear"
+
+
+def test_normal_score_pre_feature_pickle_compat():
+    """(e) pre-feature pickle compat: an instance lacking the .extrapolation
+    attribute (as unpickled from before the feature existed) falls back to the
+    deprecated boolean. After deleting .extrapolation, transforming an
+    out-of-range value still works (finite) and _extrapolation_mode() resolves
+    to "quadratic"."""
+    col = 'c'
+    df = _curved_frame(col)
+
+    t = pyemu.emulators.NormalScoreTransformer(quadratic_extrapolation=True)
+    t.fit(df)
+
+    # simulate a pre-feature pickle: the attribute simply isn't there
+    del t.extrapolation
+
+    assert t._extrapolation_mode() == "quadratic"
+
+    originals = np.asarray(t.column_parameters[col]['originals'])
+    max_orig = originals.max()
+    span = max_orig - originals.min()
+    out = t.transform(pd.DataFrame({col: [max_orig + 0.5 * span]}))[col].values
+    assert np.all(np.isfinite(out))
