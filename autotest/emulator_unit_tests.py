@@ -1272,7 +1272,7 @@ class TestDSIRunstoreForwardRunOrdering:
     ValueError and orders pvals correctly (integration)."""
 
     def test_dsi_runstore_forward_run_dsiae_names(self, tmp_path, monkeypatch):
-        import pyemu.emulators as emu_mod
+        import pickle
         import pyemu.utils.helpers as H
         from pyemu.emulators import DSIAE
         from pyemu.utils.helpers import dsi_runstore_forward_run
@@ -1283,6 +1283,11 @@ class TestDSIRunstoreForwardRunOrdering:
                             columns=[f"obs{i}" for i in range(10)])
         dsiae = DSIAE(data=data, latent_dim=latent_dim, verbose=False)
         dsiae.fit(epochs=2, batch_size=16, early_stopping=False)
+
+        # the forward run loads the emulator with plain pickle.load — write a real
+        # dsi.pickle, no DSIAE.load monkeypatch (that mechanism no longer exists)
+        with open(tmp_path / "dsi.pickle", "wb") as f:
+            pickle.dump(dsiae, f)
 
         # file order is NOT latent order (dsi_par0010 sits before dsi_par0002)
         par_names_file = ["dsi_par0000", "dsi_par0001", "dsi_par0010", "dsi_par0002",
@@ -1319,8 +1324,6 @@ class TestDSIRunstoreForwardRunOrdering:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "dsi.rns").write_bytes(b"")
         monkeypatch.setattr(H, "RunStor", FakeRS)
-        monkeypatch.setattr(emu_mod, "DSIAE",
-                            type("X", (), {"load": staticmethod(lambda p: dsiae)}))
 
         # must NOT raise ValueError on the dsi_parNNNN names
         dsi_runstore_forward_run(ws=str(tmp_path), pst_name="dsi")
@@ -1992,28 +1995,28 @@ class TestInsTplCanonicalFormat:
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
 class TestDSIVCOverDSIAE:
-    """DSIVC is emulator-agnostic: it consumes only emulator.fitted and
-    emulator.data, so a fitted DSIAE composes the same as a DSI.
+    """DSIVC composes over a DSIAE whose OWN runstore template it consumes.
 
-    Prepare-level only (no binary run): a full DSIAE runstore template via
-    DSIAE.prepare_pestpp is still blocked by known DSIAE defects, so the
-    template here is DSI-produced over the same training data."""
+    DSIAE.prepare_pestpp(..., use_runstor=True) now emits a complete
+    runstore-prepared interface (dsi.pst / dsi.pickle / runstore forward_run.py),
+    so the DSIVC is built directly over the DSIAE template — no DSI stand-in."""
 
     def test_dsiae_prepare_pestpp(self, tmp_path):
+        import pyemu
         from pyemu.emulators import DSIAE
         from pyemu.emulators.dsivc import DSIVC
 
-        # runstore template + matching oe (DSI-produced, same data/obs names)
-        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
-        oe = _make_oe(pst, cols)
-
-        # no pst: DSIAE.__init__ can't take a DataFrame pst (known defect) and
-        # DSIVC consumes only emulator.fitted + emulator.data anyway
-        data, _, _ = _dsivc_synth()
-        dsiae = DSIAE(data=data, latent_dim=2, verbose=False)
+        data, obsdata, cols = _dsivc_synth()
+        dsiae = DSIAE(data=data, pst=obsdata, latent_dim=2, verbose=False)
         dsiae.fit(epochs=2)
 
-        dv = DSIVC(emulator=dsiae, dsi_t_d=dsi_t_d, oe=oe, verbose=False)
+        # DSIAE produces its own runstore template
+        dsiae_t_d = str(tmp_path / "dsiae_t_d")
+        dsiae.prepare_pestpp(dsiae_t_d, observation_data=obsdata, use_runstor=True)
+        pst = pyemu.Pst(os.path.join(dsiae_t_d, "dsi.pst"))
+        oe = _make_oe(pst, cols)
+
+        dv = DSIVC(emulator=dsiae, dsi_t_d=dsiae_t_d, oe=oe, verbose=False)
         out = str(tmp_path / "out_dsiae")
         pstv = dv.prepare_pestpp(out, decvar_names=["head2", "flow"],
                                  percentiles=[0.5], inner_noptmax=2)
@@ -2030,6 +2033,188 @@ class TestDSIVCOverDSIAE:
                               float(dsiae.data[dv_name].median()))
             assert np.isclose(float(par.loc[dv_name, "parlbnd"]),
                               float(dsiae.data[dv_name].min()))
+
+
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
+class TestDSIAE:
+    """End-to-end unit tests for the DSIAE variational-autoencoder emulator."""
+
+    LATENT_DIM = 2
+
+    @staticmethod
+    def _data(seed=13, n_real=100, n_obs=6):
+        np.random.seed(seed)
+        data = pd.DataFrame(np.random.normal(size=(n_real, n_obs)),
+                            columns=[f"obs{i}" for i in range(n_obs)])
+        obsdata = pd.DataFrame(
+            {"obsnme": data.columns, "obsval": data.mean().values,
+             "weight": 1.0, "obgnme": "obgnme"},
+            index=data.columns,
+        )
+        return data, obsdata
+
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        """One fitted DSIAE shared across the read-only tests."""
+        from pyemu.emulators import DSIAE
+        data, obsdata = self._data()
+        dsiae = DSIAE(data=data, pst=obsdata, latent_dim=self.LATENT_DIM,
+                      verbose=False)
+        dsiae.fit(epochs=2, batch_size=32)
+        return dsiae, data, obsdata
+
+    def test_pickle_round_trip(self, fitted):
+        """pickle.dumps/loads preserves predict and encode outputs."""
+        import pickle
+        dsiae, data, _ = fitted
+
+        pred_before = dsiae.predict(np.zeros(self.LATENT_DIM))
+        enc_before = dsiae.encode(data)
+
+        loaded = pickle.loads(pickle.dumps(dsiae))
+        pred_after = loaded.predict(np.zeros(self.LATENT_DIM))
+        enc_after = loaded.encode(data)
+
+        np.testing.assert_allclose(pred_before.values, pred_after.values)
+        np.testing.assert_allclose(enc_before.values, enc_after.values)
+
+    def test_prepared_control_file(self, fitted, tmp_path):
+        """prepare_pestpp(use_runstor=True) writes the full latent interface."""
+        import pickle
+        from pyemu.en import ParameterEnsemble
+        dsiae, data, obsdata = fitted
+
+        td = str(tmp_path / "td")
+        pst = dsiae.prepare_pestpp(td, observation_data=obsdata, use_runstor=True)
+
+        assert list(pst.parameter_data.index) == ["p_0", "p_1"]
+        assert (pst.parameter_data["parval1"].values == 0.0).all()
+        assert (pst.parameter_data["parlbnd"].values == -10.0).all()
+        assert (pst.parameter_data["parubnd"].values == 10.0).all()
+
+        assert os.path.exists(os.path.join(td, "dsi.unc"))
+        assert pst.pestpp_options["parcov"] == "dsi.unc"
+        assert pst.pestpp_options["ies_parameter_ensemble"] == "latent_prior.jcb"
+
+        pe = ParameterEnsemble.from_binary(
+            pst=pst, filename=os.path.join(td, "latent_prior.jcb"))
+        assert pe.shape == (data.shape[0], self.LATENT_DIM)
+        # the encoded prior is calibrated: exactly zero-mean/unit-std per
+        # coordinate, matching parval1=0 and the unit-std parcov in dsi.unc
+        np.testing.assert_allclose(pe._df.mean().values, 0.0, atol=1e-6)
+        np.testing.assert_allclose(pe._df.std(ddof=1).values, 1.0, rtol=1e-6)
+
+        with open(os.path.join(td, "dsi.pickle"), "rb") as f:
+            loaded = pickle.load(f)
+        assert loaded.predict(np.zeros(self.LATENT_DIM)).shape[0] == data.shape[1]
+
+    def test_predict_input_handling(self, fitted):
+        """Series/DataFrame/ndarray inputs map to the expected output types."""
+        dsiae, _, _ = fitted
+        cols = [f"p_{i}" for i in range(self.LATENT_DIM)]
+
+        out_series = dsiae.predict(pd.Series(np.zeros(self.LATENT_DIM), index=cols))
+        assert isinstance(out_series, pd.Series)
+
+        out_one_row = dsiae.predict(pd.DataFrame([[0.0, 0.0]], columns=cols))
+        assert isinstance(out_one_row, pd.DataFrame)
+        assert out_one_row.shape[0] == 1
+
+        out_multi = dsiae.predict(pd.DataFrame(np.zeros((3, self.LATENT_DIM)),
+                                               columns=cols))
+        assert isinstance(out_multi, pd.DataFrame)
+        assert out_multi.shape[0] == 3
+
+        out_1d = dsiae.predict(np.zeros(self.LATENT_DIM))
+        assert isinstance(out_1d, pd.Series)
+
+        out_2d = dsiae.predict(np.zeros((4, self.LATENT_DIM)))
+        assert isinstance(out_2d, pd.DataFrame)
+        assert out_2d.shape[0] == 4
+
+        with pytest.raises(ValueError,
+                           match=f"must have {self.LATENT_DIM} parameters"):
+            dsiae.predict(np.zeros(self.LATENT_DIM + 3))
+
+    def test_encode(self, fitted):
+        """encode preserves the DataFrame index and emits p_0..p_k columns."""
+        from pyemu.emulators import DSIAE
+        dsiae, data, _ = fitted
+
+        df_index = data.iloc[[5, 9, 11]]
+        enc = dsiae.encode(df_index)
+        assert list(enc.index) == [5, 9, 11]
+        assert list(enc.columns) == ["p_0", "p_1"]
+
+        enc_arr = dsiae.encode(data.values)
+        assert enc_arr.shape == (data.shape[0], self.LATENT_DIM)
+        assert list(enc_arr.columns) == ["p_0", "p_1"]
+
+        unfit = DSIAE(data=data, latent_dim=self.LATENT_DIM, verbose=False)
+        with pytest.raises(ValueError, match="fitted"):
+            unfit.encode(data)
+        with pytest.raises(ValueError, match="fitted"):
+            unfit.predict(np.zeros(self.LATENT_DIM))
+
+    def test_latent_dim_and_projection(self, fitted):
+        """compute_projection_matrix is unavailable; latent_dim is the ctor value."""
+        from pyemu.emulators import DSIAE
+        dsiae, data, _ = fitted
+
+        with pytest.raises(NotImplementedError):
+            dsiae.compute_projection_matrix()
+
+        assert dsiae.latent_dim == self.LATENT_DIM
+
+        # an explicit latent_dim wins over the energy threshold
+        explicit = DSIAE(data=data, latent_dim=3, energy_threshold=0.5,
+                         verbose=False)
+        assert explicit.latent_dim == 3
+
+    def test_fit_report(self, fitted):
+        """fit_report carries the latent/reconstruction diagnostics, all finite."""
+        dsiae, _, _ = fitted
+        report = dsiae.fit_report
+        assert isinstance(report, dict)
+        for key in ("latent_abs_mean_max", "latent_std_min", "latent_std_max",
+                    "recon_std_ratio_min", "recon_std_ratio_median"):
+            assert key in report
+            assert np.isfinite(report[key])
+
+    def test_full_validation_prepare(self, tmp_path):
+        """prepare_pestpp(use_runstor=False) runs the generated forward_run.py."""
+        from pyemu.emulators import DSIAE
+        data, obsdata = self._data()
+        dsiae = DSIAE(data=data, pst=obsdata, latent_dim=self.LATENT_DIM,
+                      verbose=False)
+        dsiae.fit(epochs=2, batch_size=32)
+
+        td = str(tmp_path / "td2")
+        pst = dsiae.prepare_pestpp(td, observation_data=obsdata, use_runstor=False)
+        assert os.path.exists(os.path.join(td, "dsi.pst"))
+        assert os.path.exists(os.path.join(td, "dsi_sim_vals.csv"))
+        assert pst.nobs == data.shape[1]
+
+    def test_mixed_case_columns_lowercased(self, tmp_path):
+        """Training columns are lowercased at intake and through prepare."""
+        from pyemu.emulators import DSIAE
+        np.random.seed(3)
+        cols = ["Head1", "FLUX2", "Obs3", "mix4"]
+        data = pd.DataFrame(np.random.normal(size=(80, len(cols))), columns=cols)
+        obsdata = pd.DataFrame(
+            {"obsnme": cols, "obsval": data.mean().values,
+             "weight": 1.0, "obgnme": "obgnme"},
+            index=cols,
+        )
+        dsiae = DSIAE(data=data, pst=obsdata, latent_dim=self.LATENT_DIM,
+                      verbose=False)
+        dsiae.fit(epochs=2, batch_size=16)
+
+        assert list(dsiae.data.columns) == ["head1", "flux2", "obs3", "mix4"]
+
+        td = str(tmp_path / "td_mc")
+        pst = dsiae.prepare_pestpp(td, observation_data=obsdata, use_runstor=True)
+        assert list(pst.observation_data.index) == ["head1", "flux2", "obs3", "mix4"]
 
 
 if __name__ == "__main__":

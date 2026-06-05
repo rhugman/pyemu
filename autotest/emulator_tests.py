@@ -441,429 +441,89 @@ def test_lpfa_std(tmp_path):
     return
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def dsiae_basic(transforms=None):
-    """Basic DSIAE test using synth dataset - minimal compute"""
-
-    if not HAS_TENSORFLOW:
-        pytest.skip("TensorFlow not available, skipping DSIAE tests")
-
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
-
-
-    # Test DSIAE initialization and basic functionality
-    from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, transforms=transforms, latent_dim=3, verbose=False)  # Fixed small latent dim
-
-    # Test fit with minimal parameters for speed
-    dsiae.fit(validation_split=0.2, epochs=5, batch_size=16, early_stopping=False)  # Very few epochs
-
-    # Test encoding
-    Z = dsiae.encode(data.iloc[:5])  # Test with just 5 samples
-    assert Z.shape[0] == 5
-    assert Z.shape[1] == 3  # latent_dim
-
-    # Test prediction
-    sim_vals = dsiae.predict(Z.iloc[0])
-    assert len(sim_vals) == len(data.columns)
-
-    return dsiae, obsdata
-
-
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
 def test_dsiae_basic():
-    """Test basic DSIAE functionality with transforms"""
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
+    """DSIAE fit/encode/predict with a normal-score transform."""
+    data, obsdata = generate_synth_data(num_realizations=100, num_observations=10)
 
-    transforms = [
-        {"type": "normal_score", }
-    ]
+    transforms = [{"type": "normal_score"}]
 
-    # Test DSIAE initialization and basic functionality
     from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, transforms=transforms, latent_dim=3, verbose=False)  # Fixed small latent dim
-    # Test fit with minimal parameters for speed
-    dsiae.fit(validation_split=0.2, epochs=5, batch_size=16, early_stopping=False)  # Very few epochs
+    dsiae = DSIAE(data=data, transforms=transforms, latent_dim=3, verbose=False)
+    dsiae.fit(validation_split=0.2, epochs=5, batch_size=16, early_stopping=False)
     assert dsiae.fitted
 
-    # Test encoding
-    Z = dsiae.encode(data.iloc[:5])  # Test with just 5 samples
+    Z = dsiae.encode(data.iloc[:5])
     assert Z.shape[0] == 5
-    assert Z.shape[1] == 3  # latent_dim
+    assert Z.shape[1] == 3
+    assert list(Z.columns) == [f"p_{i}" for i in range(3)]
 
-    # Test prediction
     sim_vals = dsiae.predict(Z.iloc[0])
     assert len(sim_vals) == len(data.columns)
-
-
-    return
-
 
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
 def test_dsiae_auto_latent_dim():
-    """Test DSIAE with automatic latent dimension selection"""
-
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
+    """DSIAE selects a positive integer latent dim from the energy threshold."""
+    data, obsdata = generate_synth_data(num_realizations=100, num_observations=10)
 
     from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, latent_dim=None, energy_threshold=0.8)  # Auto dimension
-    dsiae.fit(epochs=3, batch_size=8)  # Minimal training
+    dsiae = DSIAE(data=data, latent_dim=None, energy_threshold=0.8)
+    dsiae.fit(epochs=3, batch_size=8)
 
     assert dsiae.fitted
-    assert dsiae.latent_dim > 0
-    return
+    assert isinstance(dsiae.latent_dim, int)
+    assert dsiae.latent_dim >= 1
 
-#@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-@pytest.mark.skip(reason="it is hanging in CI for some reason;passes locally")
+
+@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
 def test_dsiae_with_ies(tmp_path):
-
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
+    """End-to-end DSIAE: fit -> runstore-prepared dsi.pst -> seeded prior Monte
+    Carlo (pestpp-ies /e, noptmax=-1) in a single process. The produced prior
+    obs ensemble must match the decoder applied to the latent prior draws."""
+    data, obsdata = generate_synth_data(num_realizations=100, num_observations=10)
 
     from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, latent_dim=3)  # Auto dimension
-    dsiae.fit(epochs=3, batch_size=8)  # Minimal training
+    dsiae = DSIAE(data=data, latent_dim=3)
+    dsiae.fit(epochs=10, batch_size=16)
 
     td = tmp_path / "template_dsiae"
-    pstdsi = dsiae.prepare_pestpp(td,observation_data=obsdata)
-    pstdsi.control_data.noptmax = -1
-    pstdsi.pestpp_options["ies_num_reals"] = 3
-    pstdsi.write(os.path.join(td, "dsi.pst"),version=2)
+    pst = dsiae.prepare_pestpp(td, observation_data=obsdata, use_runstor=True)
+    pst.control_data.noptmax = -1
+    pst.pestpp_options["ies_num_reals"] = 10
+    pst.write(os.path.join(td, "dsi.pst"), version=2)
 
-    pvals = pd.read_csv(os.path.join(td, "dsi_pars.csv"), index_col=0)
-    md = tmp_path / f"master_dsiae"
-    num_workers = 1
-    worker_root = tmp_path
-    print("dsi_exe: ", ies_exe_path)
-    pyemu.os_utils.start_workers(
-        td,ies_exe_path,"dsi.pst", num_workers=num_workers,
-        worker_root=worker_root, master_dir=md, port=_get_port(),
-        ppw_function=pyemu.helpers.dsi_pyworker,
-        ppw_kwargs={
-            "dsi": dsiae, "pvals": pvals,
-        }
-    )
-    return
+    pyemu.os_utils.run(f"{ies_exe_path} dsi.pst /e", cwd=td)
 
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_autoencoder_basic():
-    """Test standalone AutoEncoder functionality"""
-
-    from pyemu.emulators.dsiae import AutoEncoder
-
-    # Create simple synthetic data
-    rng = np.random.RandomState(42)
-    X = rng.standard_normal((50, 10,)).astype(np.float32)  # 50 samples, 10 features
-
-    # Test initialization
-    ae = AutoEncoder(input_dim=10, latent_dim=3, hidden_dims=(8, 4))
-
-    # Test fit with minimal parameters
-    history = ae.fit(X, epochs=3, batch_size=16, verbose=0)
-    assert history is not None
-
-    # Test encode/decode
-    Z = ae.encode(X[:5])  # Test with 5 samples
-    assert Z.shape == (5, 3)  # latent_dim = 3
-
-    X_reconstructed = ae.decode(Z)
-    assert X_reconstructed.shape == (5, 10)  # original input_dim = 10
-
-    return
-
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_autoencoder_pandas_input():
-    """Test AutoEncoder with pandas DataFrame input"""
-
-    from pyemu.emulators.dsiae import AutoEncoder
-
-    # Create pandas DataFrame
-    rng = np.random.RandomState(42)
-    data = pd.DataFrame(rng.standard_normal((30, 8,)),
-                       columns=[f'feature_{i}' for i in range(8)],
-                       index=[f'sample_{i}' for i in range(30)])
-
-    ae = AutoEncoder(input_dim=8, latent_dim=2, hidden_dims=(6,))
-    ae.fit(data.values, epochs=2, verbose=0)
-
-    # Test with DataFrame input
-    Z = ae.encode(data.iloc[:3])
-    assert Z.shape == (3, 2)
-
-    # Test with Series input
-    Z_series = ae.encode(data.iloc[0])
-    assert Z_series.shape == (1, 2)
-
-    return
-
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_dsiae_hyperparam_search():
-    """Test DSIAE hyperparameter search"""
-
-    dsiae, obsdata = dsiae_basic()
-
-    # Test with minimal search space
-    results = dsiae.hyperparam_search(
-        latent_dims=[2, 3],
-        hidden_dims_list=[(8,)],  # Single architecture
-        lrs=[1e-2],  # Single learning rate
-        epochs=2,  # Very few epochs
-        batch_size=8
-    )
-
-    assert isinstance(results, dict)
-    assert len(results) > 0
-
-    return
-
-def dsiae_basic(transforms=None):
-    """Basic DSIAE test using synth dataset - minimal compute"""
-
-    if not HAS_TENSORFLOW:
-        pytest.skip("TensorFlow not available, skipping DSIAE tests")
-
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
-
-
-    # Test DSIAE initialization and basic functionality
-    from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, transforms=transforms, latent_dim=3, verbose=False)  # Fixed small latent dim
-
-    # Test fit with minimal parameters for speed
-    dsiae.fit(validation_split=0.2, epochs=5, batch_size=16, early_stopping=False)  # Very few epochs
-
-    # Test encoding
-    Z = dsiae.encode(data.iloc[:5])  # Test with just 5 samples
-    assert Z.shape[0] == 5
-    assert Z.shape[1] == 3  # latent_dim
-
-    # Test prediction
-    sim_vals = dsiae.predict(Z.iloc[0])
-    assert len(sim_vals) == len(data.columns)
-
-    return dsiae, obsdata
-
-
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_dsiae_basic():
-    """Test basic DSIAE functionality with transforms"""
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
-
-    transforms = [
-        {"type": "normal_score", }
-    ]
-
-    # Test DSIAE initialization and basic functionality
-    from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, transforms=transforms, latent_dim=3, verbose=False)  # Fixed small latent dim
-    # Test fit with minimal parameters for speed
-    dsiae.fit(validation_split=0.2, epochs=5, batch_size=16, early_stopping=False)  # Very few epochs
-    assert dsiae.fitted
-
-    # Test encoding
-    Z = dsiae.encode(data.iloc[:5])  # Test with just 5 samples
-    assert Z.shape[0] == 5
-    assert Z.shape[1] == 3  # latent_dim
-
-    # Test prediction
-    sim_vals = dsiae.predict(Z.iloc[0])
-    assert len(sim_vals) == len(data.columns)
-
-
-    return
-
-
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_dsiae_auto_latent_dim():
-    """Test DSIAE with automatic latent dimension selection"""
-
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
-
-    from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, latent_dim=None, energy_threshold=0.8)  # Auto dimension
-    dsiae.fit(epochs=3, batch_size=8)  # Minimal training
-
-    assert dsiae.fitted
-    assert dsiae.latent_dim > 0
-    return
-
-#@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-@pytest.mark.skip(reason="it is hanging in CI for some reason;passes locally")
-def test_dsiae_with_ies(tmp_path, use_runstor=True):
-
-    data, obsdata = generate_synth_data(num_realizations=100,num_observations=10)
-
-    from pyemu.emulators import DSIAE
-    dsiae = DSIAE(data=data, latent_dim=3)  # Auto dimension
-    dsiae.fit(epochs=3, batch_size=8)  # Minimal training
-
-    td = tmp_path / "template_dsiae"
-    pstdsi = dsiae.prepare_pestpp(td,observation_data=obsdata)
-    pstdsi.control_data.noptmax = -1
-    pstdsi.pestpp_options["ies_num_reals"] = 3
-    pstdsi.write(os.path.join(td, "dsi.pst"),version=2)
-
-    pvals = pd.read_csv(os.path.join(td, "dsi_pars.csv"), index_col=0)
-    md = tmp_path / f"master_dsiae"
-    num_workers = 1
-    worker_root = tmp_path
-    print("dsi_exe: ", ies_exe_path)
-    if use_runstor:
-        pyemu.os_utils.run("pestpp-ies dsi.pst /e", cwd=td, verbose=True)
+    # load the produced prior obs ensemble (csv or jcb)
+    pst_run = pyemu.Pst(os.path.join(td, "dsi.pst"))
+    jcb = os.path.join(td, "dsi.0.obs.jcb")
+    if os.path.exists(jcb):
+        oe = pyemu.ObservationEnsemble.from_binary(pst=pst_run, filename=jcb)
     else:
-        pyemu.os_utils.start_workers(
-            td,ies_exe_path,"dsi.pst", num_workers=num_workers,
-            worker_root=worker_root, master_dir=md, port=_get_port(),
-            ppw_function=pyemu.helpers.dsi_pyworker,
-            ppw_kwargs={
-                "dsi": dsiae, "pvals": pvals,
-            }
-        )
-    return
+        oe = pyemu.ObservationEnsemble.from_csv(
+            pst=pst_run, filename=os.path.join(td, "dsi.0.obs.csv"))
+    oe_df = oe._df.copy()
 
+    obs_cols = [c.lower() for c in data.columns]
+    assert oe_df.shape[0] >= 10  # pestpp may add a base run
+    assert all(c in oe_df.columns for c in obs_cols)
+    assert np.all(np.isfinite(oe_df[obs_cols].values))
 
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_autoencoder_basic():
-    """Test standalone AutoEncoder functionality"""
+    # decode the latent prior draws and assert the runstore obs values match
+    pe = pyemu.ParameterEnsemble.from_binary(
+        pst=pst_run, filename=os.path.join(td, "latent_prior.jcb"))
+    pe_df = pe._df.copy()
+    pe_df.index = [str(i).lower() for i in pe_df.index]
+    oe_df.index = [str(i).lower() for i in oe_df.index]
+    shared = [i for i in oe_df.index if i in pe_df.index]
+    assert len(shared) > 0
 
-    from pyemu.emulators.dsiae import AutoEncoder
-
-    # Create simple synthetic data
-    rng = np.random.RandomState(42)
-    X = rng.standard_normal((50, 10,)).astype(np.float32)  # 50 samples, 10 features
-
-    # Test initialization
-    ae = AutoEncoder(input_dim=10, latent_dim=3, hidden_dims=(8, 4))
-
-    # Test fit with minimal parameters
-    history = ae.fit(X, epochs=3, batch_size=16, verbose=0)
-    assert history is not None
-
-    # Test encode/decode
-    Z = ae.encode(X[:5])  # Test with 5 samples
-    assert Z.shape == (5, 3)  # latent_dim = 3
-
-    X_reconstructed = ae.decode(Z)
-    assert X_reconstructed.shape == (5, 10)  # original input_dim = 10
-
-    return
-
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_autoencoder_pandas_input():
-    """Test AutoEncoder with pandas DataFrame input"""
-
-    from pyemu.emulators.dsiae import AutoEncoder
-
-    # Create pandas DataFrame
-    rng = np.random.RandomState(42)
-    data = pd.DataFrame(rng.standard_normal((30, 8,)),
-                       columns=[f'feature_{i}' for i in range(8)],
-                       index=[f'sample_{i}' for i in range(30)])
-
-    ae = AutoEncoder(input_dim=8, latent_dim=2, hidden_dims=(6,))
-    ae.fit(data.values, epochs=2, verbose=0)
-
-    # Test with DataFrame input
-    Z = ae.encode(data.iloc[:3])
-    assert Z.shape == (3, 2)
-
-    # Test with Series input
-    Z_series = ae.encode(data.iloc[0])
-    assert Z_series.shape == (1, 2)
-
-    return
-
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
-def test_dsiae_hyperparam_search():
-    """Test DSIAE hyperparameter search"""
-
-    dsiae, obsdata = dsiae_basic()
-
-    # Test with minimal search space
-    results = dsiae.hyperparam_search(
-        latent_dims=[2, 3],
-        hidden_dims_list=[(8,)],  # Single architecture
-        lrs=[1e-2],  # Single learning rate
-        epochs=2,  # Very few epochs
-        batch_size=8
-    )
-
-    assert isinstance(results, dict)
-    assert len(results) > 0
-
-    return
-
-@pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not installed")
-def test_dsiae_save_load(tmp_path):
-    if isinstance(tmp_path, str) and not os.path.exists(tmp_path):
-        os.makedirs(tmp_path)
-
-    # 1. Generate synthetic data
-    num_realizations = 50
-    num_observations = 20
-    data = pyemu.en.rng.normal(size=(num_realizations, num_observations))
-    data_df = pd.DataFrame(data, columns=[f"obs{i}" for i in range(num_observations)])
-
-    # 2. Initialize and fit DSIAE
-    # Using a small latent dim and few epochs for speed
-    latent_dim = 5
-    from pyemu.emulators.dsiae import DSIAE
-    dsiae = DSIAE(data=data_df, latent_dim=latent_dim, verbose=True)
-
-    # Fit the model
-    dsiae.fit(epochs=10, batch_size=10, validation_split=0.2)
-
-    assert dsiae.fitted is True
-    assert hasattr(dsiae, 'encoder')
-
-    # 3. Generate predictions on new data (or the training data)
-    # Let's use some random "parameter" values in latent space to generate observations
-    # The predict method takes pvals which are latent space values
-
-    # Generate random latent vectors
-    new_pvals = pyemu.en.rng.normal(size=(5, latent_dim))
-    new_pvals_df = pd.DataFrame(new_pvals, columns=[f"latent_{i}" for i in range(latent_dim)])
-
-    # Predict with original model
-    preds_original = dsiae.predict(new_pvals_df)
-
-    # 4. Save the model
-    save_path = os.path.join(tmp_path, "dsiae_model.zip")
-    dsiae.save(save_path)
-
-    assert os.path.exists(save_path)
-
-    # 5. Load the model
-    dsiae_loaded = DSIAE.load(save_path)
-
-    assert dsiae_loaded.fitted is True
-    assert hasattr(dsiae_loaded, 'encoder')
-
-    # 6. Compare structure and weights
-    # Check encoder weights
-    for w_orig, w_load in zip(dsiae.encoder.encoder.get_weights(), dsiae_loaded.encoder.encoder.get_weights()):
-        np.testing.assert_allclose(w_orig, w_load, rtol=1e-5, atol=1e-5, err_msg="Encoder weights do not match")
-
-    # Check decoder weights
-    for w_orig, w_load in zip(dsiae.encoder.decoder.get_weights(), dsiae_loaded.encoder.decoder.get_weights()):
-        np.testing.assert_allclose(w_orig, w_load, rtol=1e-5, atol=1e-5, err_msg="Decoder weights do not match")
-
-    # 7. Compare predictions
-    preds_loaded = dsiae_loaded.predict(new_pvals_df)
-
-    if isinstance(preds_original, (pd.Series, pd.DataFrame)):
-        pd.testing.assert_frame_equal(pd.DataFrame(preds_original), pd.DataFrame(preds_loaded), check_dtype=False)
-    else:
-        np.testing.assert_allclose(preds_original, preds_loaded, rtol=1e-5, atol=1e-5)
-
-    print("Save/Load test passed successfully!")
+    expected = dsiae.predict(pe_df.loc[shared])
+    expected.columns = [c.lower() for c in expected.columns]
+    np.testing.assert_allclose(
+        oe_df.loc[shared, obs_cols].values,
+        expected.loc[shared, obs_cols].values,
+        rtol=1e-3, atol=1e-4)
 
 
 def test_dsi_rowwise(tmp_path):
