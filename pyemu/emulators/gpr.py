@@ -472,16 +472,13 @@ class GPR(Emulator):
 
     def _write_instruction_file(self, obs_df, filename):
         """Writes GPR-specific instruction file (handling std dev)."""
-        with open(filename, 'w') as f:
-            f.write("pif ~\n")
-            f.write("l1\n") # header
-            for output_name in self.output_names:
-                if self.return_std:
-                     # e.g. "obsnme, val, std"
-                     # Instruction: Skip obsnme, read val, read std
-                     f.write("l1 ~,~ !{0}! ~,~ !{0}_gprstd!\n".format(output_name))
-                else:
-                     f.write("l1 ~,~ !{0}!\n".format(output_name))
+        from pyemu.pst.pst_utils import csv_ins_from_obsnames
+        if self.return_std:
+            # each row carries "obsnme,val,std": read val and std per line
+            entries = [(o, f"{o}_gprstd") for o in self.output_names]
+        else:
+            entries = list(self.output_names)
+        csv_ins_from_obsnames(entries, filename)
 
     def _write_forward_run_script(self, filename, emu_file, input_file, output_file, class_name, pst_name=None):
         """Generates the python script that PEST++ runs for GPR (handles tuple return)."""

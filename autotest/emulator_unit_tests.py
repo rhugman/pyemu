@@ -1932,6 +1932,27 @@ class TestDSIVCCanonicalOrder:
         assert org_order != shuffled
 
 
+class TestInsTplCanonicalFormat:
+    """The emulator interfaces delegate ins/tpl writing to the canonical
+    pst_utils writers; pin the on-disk format (the old base.py copy had
+    drifted to 'l1~,~' without the space)."""
+
+    def test_prepared_template_uses_canonical_ins_tpl(self, tmp_path):
+        dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
+
+        ins = open(os.path.join(dsi_t_d, "dsi_sim_vals.csv.ins")).read()
+        assert "l1~,~" not in ins  # the pre-consolidation drift
+        for line in ins.splitlines()[2:]:
+            assert line.startswith("l1 ~,~ !"), line
+
+        tpl = open(os.path.join(dsi_t_d, "dsi_pars.csv.tpl")).read().splitlines()
+        assert tpl[0] == "ptf ~"
+        assert tpl[1] == "parnme,parval1"
+        for line in tpl[2:]:
+            name = line.split(",")[0]
+            assert line == f"{name},~   {name}   ~"
+
+
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
 class TestDSIVCOverDSIAE:
     """DSIVC is emulator-agnostic: it consumes only emulator.fitted and

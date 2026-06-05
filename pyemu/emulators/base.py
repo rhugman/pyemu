@@ -452,16 +452,9 @@ class Emulator:
         return pst_obs_df
 
     def _write_template_file(self, par_df, filename):
-        """Writes a simple CSV template file."""
-        # This implementation assumes parameters are rows in a single-column CSV or similar structure
-        # Subclasses might want different input formats, but a standard vertical CSV is robust.
-        # Format: parnme, parval1
-        
-        with open(filename, 'w') as f:
-            f.write("ptf ~\n")
-            f.write("parnme,parval1\n")
-            for parnme in par_df.index:
-                 f.write(f"{parnme},~   {parnme}   ~\n")
+        """Writes a simple CSV template file (parnme,parval1 rows)."""
+        from pyemu.pst.pst_utils import csv_tpl_from_parnames
+        csv_tpl_from_parnames(par_df.index, filename)
 
     def _write_input_file(self, par_df, filename):
         """Writes the initial input file corresponding to the template."""
@@ -479,14 +472,10 @@ class Emulator:
                 f.write(f"{obsnme},{obs_df.loc[obsnme, 'obsval']}\n") # base value
 
     def _write_instruction_file(self, obs_df, filename):
-        """Writes a simple CSV instruction file."""
+        """Writes a simple CSV instruction file (one value read per row)."""
         # Assumes output format from forward_run.py is: obsnme,simval
-        # Standard vertical CSV
-        with open(filename, 'w') as f:
-            f.write("pif ~\n")
-            f.write("l1\n") # header
-            for obsnme in obs_df.index:
-                f.write(f"l1~,~ !{obsnme}!\n")
+        from pyemu.pst.pst_utils import csv_ins_from_obsnames
+        csv_ins_from_obsnames(obs_df.index, filename)
 
     def _write_forward_run_script(self, filename, emu_file, input_file, output_file, class_name, pst_name=None):
         """Generates the python script that PEST++ runs.

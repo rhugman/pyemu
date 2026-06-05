@@ -4495,10 +4495,7 @@ def prep_for_gpr(pst_fname,input_fnames,output_fnames,gpr_t_d="gpr_template",t_d
 
     #write a template file
     tpl_fname = os.path.join(gpr_t_d,"gpr_input.csv.tpl")
-    with open(tpl_fname,'w') as f:
-        f.write("ptf ~\nparnme,parval1\n")
-        for input_name in input_names:
-            f.write("{0},~  {0}   ~\n".format(input_name))
+    pyemu.pst_utils.csv_tpl_from_parnames(input_names, tpl_fname)
     other_pars = list(set(pst.par_names)-set(input_names))
     aux_tpl_fname = None
 
@@ -4506,19 +4503,14 @@ def prep_for_gpr(pst_fname,input_fnames,output_fnames,gpr_t_d="gpr_template",t_d
 
         aux_tpl_fname = os.path.join(gpr_t_d,"aux_par.csv.tpl")
         print("writing aux par tpl file: ",aux_tpl_fname)
-        with open(aux_tpl_fname,'w') as f:
-            f.write("ptf ~\n")
-            for input_name in other_pars:
-                f.write("{0},~  {0}   ~\n".format(input_name))
+        pyemu.pst_utils.csv_tpl_from_parnames(other_pars, aux_tpl_fname, header=None)
     #write an ins file
     ins_fname = os.path.join(gpr_t_d,"gpr_output.csv.ins")
-    with open(ins_fname,'w') as f:
-        f.write("pif ~\nl1\n")
-        for output_name in output_names:
-            if include_emulated_std_obs:
-                f.write("l1 ~,~ !{0}! ~,~ !{0}_gprstd!\n".format(output_name))
-            else:
-                f.write("l1 ~,~ !{0}!\n".format(output_name))
+    if include_emulated_std_obs:
+        entries = [(o, "{0}_gprstd".format(o)) for o in output_names]
+    else:
+        entries = list(output_names)
+    pyemu.pst_utils.csv_ins_from_obsnames(entries, ins_fname)
     tpl_list = [tpl_fname]
     if aux_tpl_fname is not None:
         tpl_list.append(aux_tpl_fname)
@@ -5070,11 +5062,7 @@ def series_to_insfile(out_file,ins_file=None):
     sdf = pd.read_csv(out_file,index_col=0)
     assert sdf.shape[1] == 1, "only one column allowed"
     sdf = sdf.iloc[:,0]
-    with open(ins_file,'w') as f:
-        f.write("pif ~\n")
-        f.write("l1\n")
-        for oname in sdf.index.values:
-            f.write("l1 ~,~ !{0}!\n".format(oname))
+    pyemu.pst_utils.csv_ins_from_obsnames(sdf.index.values, ins_file)
     return
 
 

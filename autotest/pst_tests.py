@@ -1821,6 +1821,63 @@ def add_phi_test(tmp_path):
     assert "composite" in pst.obs_names
 
 
+def csv_tpl_ins_writers_test(tmp_path):
+    """pin the canonical vertical-CSV tpl/ins writers (pst_utils) byte-for-byte
+    and prove they round-trip through pyemu's own tpl/ins machinery."""
+    import pandas as pd
+    import pyemu
+    from pyemu.pst.pst_utils import csv_tpl_from_parnames, csv_ins_from_obsnames
+
+    names = ["p_one", "p_two"]
+
+    # tpl: exact canonical content, with and without header
+    tpl = os.path.join(tmp_path, "in.csv.tpl")
+    csv_tpl_from_parnames(names, tpl)
+    expected = ("ptf ~\n"
+                "parnme,parval1\n"
+                "p_one,~   p_one   ~\n"
+                "p_two,~   p_two   ~\n")
+    assert open(tpl).read() == expected
+    csv_tpl_from_parnames(names, tpl, header=None)
+    assert open(tpl).read() == expected.replace("parnme,parval1\n", "")
+
+    # tpl round-trip: parse names, fill values, read back
+    csv_tpl_from_parnames(names, tpl)
+    assert set(pyemu.pst_utils.parse_tpl_file(tpl)) == set(names)
+    vals = pd.Series([1.5, 2.5e-3], index=names)
+    in_file = os.path.join(tmp_path, "in.csv")
+    pyemu.pst_utils.write_to_template(vals, tpl, in_file)
+    filled = pd.read_csv(in_file, index_col=0).iloc[:, 0]
+    assert np.allclose(filled.loc[names].values, vals.values)
+
+    # ins: exact canonical content for plain and multi-value (gpr-std) rows;
+    # 'l1 ~,~' with the space is THE format (base.py's old 'l1~,~' drift)
+    ins = os.path.join(tmp_path, "out.csv.ins")
+    csv_ins_from_obsnames(["o1", ("o2", "o2_gprstd")], ins)
+    expected = ("pif ~\n"
+                "l1\n"
+                "l1 ~,~ !o1!\n"
+                "l1 ~,~ !o2! ~,~ !o2_gprstd!\n")
+    assert open(ins).read() == expected
+
+    # numpy string names (what series_to_insfile feeds via .index.values) are
+    # single names, never char-iterated
+    np_ins = os.path.join(tmp_path, "np.csv.ins")
+    csv_ins_from_obsnames(np.array(["np_obs"]), np_ins)
+    assert "l1 ~,~ !np_obs!\n" in open(np_ins).read()
+
+    # ins round-trip through pyemu's InstructionFile
+    out_file = os.path.join(tmp_path, "out.csv")
+    with open(out_file, "w") as f:
+        f.write("obsnme,simval,simstd\n")
+        f.write("o1,1.5\n")
+        f.write("o2,2.5,0.25\n")
+    df = pyemu.pst_utils.InstructionFile(ins).read_output_file(out_file)
+    assert np.isclose(df.loc["o1", "obsval"], 1.5)
+    assert np.isclose(df.loc["o2", "obsval"], 2.5)
+    assert np.isclose(df.loc["o2_gprstd", "obsval"], 0.25)
+
+
 if __name__ == "__main__":
     """
     Tests may need modifying to support passing a tmp_path argument

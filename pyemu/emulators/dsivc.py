@@ -22,6 +22,7 @@ import pandas as pd
 
 from pyemu.logger import Logger
 from pyemu.pst.pst_handler import Pst
+from pyemu.pst.pst_utils import csv_tpl_from_parnames
 from pyemu.en import ObservationEnsemble, ParameterEnsemble
 from pyemu.utils.helpers import series_to_insfile
 from .base import Emulator
@@ -301,13 +302,11 @@ class DSIVC:
         in_file = os.path.join(t_d, DSIVC_PARS_CSV)
         tpl_file = in_file + ".tpl"
         train = self.emulator.data
-        with open(tpl_file, "w") as ftpl, open(in_file, "w") as fin:
-            ftpl.write("ptf ~\n")
-            ftpl.write("parnme,parval1\n")
+        csv_tpl_from_parnames(decvar_names, tpl_file)
+        with open(in_file, "w") as fin:
             fin.write("parnme,parval1\n")
             for dv in decvar_names:
                 init = float(train.loc[:, dv].median())
-                ftpl.write(f"{dv},~   {dv}   ~\n")
                 fin.write(f"{dv},{init:.6e}\n")
 
         # --- 6. build the outer pst ----------------------------------------
