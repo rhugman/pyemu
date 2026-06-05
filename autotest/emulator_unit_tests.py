@@ -1675,6 +1675,41 @@ class TestDSIVCGeneratedScript:
                           percentiles=[0.25, 0.5], inner_noptmax=3)
         return os.path.join(out, "dsivc_forward_run.py")
 
+    def test_generated_script_is_utf8_under_nonutf8_locale(self, tmp_path):
+        """Generated .py files must be written as UTF-8 regardless of locale:
+        the embedded docstrings contain non-ASCII (em-dashes), open() without
+        an encoding uses the locale (cp1252 on windows runners), and python /
+        py_compile read sources as UTF-8 -> SyntaxError on windows.
+
+        The writer runs in a subprocess with a forced ASCII C locale (the
+        parent's locale cannot be mocked: open() resolves it at C level).
+        Without an explicit encoding the writer cannot even encode the
+        em-dash there; with encoding='utf-8' the locale is irrelevant."""
+        import subprocess
+        import sys
+        import py_compile
+
+        fname = os.path.join(tmp_path, "dsivc_forward_run.py")
+        script = (
+            "from pyemu.emulators.base import Emulator\n"
+            "from pyemu.emulators.dsivc import (_dsivc_inject_decvars,\n"
+            "    _dsivc_stack_stats, _dsivc_stack_long, dsivc_forward_run)\n"
+            f"Emulator._write_forward_run_script_body({fname!r},\n"
+            "    [_dsivc_inject_decvars, _dsivc_stack_stats,\n"
+            "     _dsivc_stack_long, dsivc_forward_run],\n"
+            "    'dsivc_forward_run', \"ies_exe_path='pestpp-ies'\")\n")
+        env = dict(os.environ)
+        env.update({"LC_ALL": "C", "LANG": "C",
+                    "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"})
+        env["PYTHONPATH"] = os.path.dirname(os.getcwd())  # repo root
+        result = subprocess.run([sys.executable, "-c", script], env=env,
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+        raw = open(fname, "rb").read()
+        raw.decode("utf-8")  # must not raise: the file must BE utf-8
+        py_compile.compile(fname, doraise=True)
+
     def test_four_embedded_top_level_functions(self, tmp_path):
         """Exactly the 4 embedded functions appear as top-level 'def ' lines
         (dsivc_forward_run also nests one helper, so total 'def ' is 5)."""

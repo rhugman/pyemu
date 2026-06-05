@@ -4544,7 +4544,7 @@ def prep_for_gpr(pst_fname,input_fnames,output_fnames,gpr_t_d="gpr_template",t_d
     frun_lines = inspect.getsource(gpr_forward_run)
     getfxn_lines = inspect.getsource(get_gpr_model_dict)
     emulfxn_lines = inspect.getsource(emulate_with_gpr)
-    with open(os.path.join(gpr_t_d, "forward_run.py"), 'w') as f:
+    with open(os.path.join(gpr_t_d, "forward_run.py"), 'w', encoding="utf-8") as f:
         f.write("\n")
         for import_name in ["pandas as pd","os","pickle","numpy as np"]:
             f.write("import {0}\n".format(import_name))
@@ -5120,7 +5120,7 @@ def add_phi_as_obs(pst_name,pst_path='.'):
     pst = pyemu.Pst(os.path.join(pst_path,pst_name))
     import inspect
     lines = inspect.getsource(calc_phi)
-    with open(os.path.join(pst_path,"calc_phi.py"),'w') as f:
+    with open(os.path.join(pst_path,"calc_phi.py"),'w',encoding="utf-8") as f:
         f.write(lines)
         f.write("\n")
         f.write("if __name__ == '__main__':\n")

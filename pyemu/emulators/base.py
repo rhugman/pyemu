@@ -507,7 +507,11 @@ class Emulator:
         lines.append('if __name__ == "__main__":')
         lines.append(f'    {target_func}({call_args})')
 
-        with open(filename, 'w') as f:
+        # generated python sources must be UTF-8: open() without an encoding
+        # uses the locale (cp1252 on windows), while python reads .py as UTF-8
+        # generated python sources must be UTF-8: open() without an encoding
+        # uses the locale (cp1252 on windows), while python reads .py as UTF-8
+        with open(filename, 'w', encoding="utf-8") as f:
             for line in lines:
                 f.write(line + "\n")
 
