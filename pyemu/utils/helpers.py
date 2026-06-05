@@ -5108,11 +5108,7 @@ def add_phi_as_obs(pst_name,pst_path='.'):
         f.write("if __name__ == '__main__':\n")
         f.write("    calc_phi('{0}')\n".format(pst_name))
     ifile_name = os.path.join(pst_path,"phi_components.csv.ins")
-    with open(os.path.join(ifile_name),'w') as f:
-        f.write("pif ~\n")
-        f.write("l1\n")
-        for idx_val in df.index:
-            f.write("l1 ~,~ !{0}!\n".format(idx_val))
+    pyemu.pst_utils.csv_ins_from_obsnames(df.index, ifile_name)
     pdf = pst.add_observations(ifile_name,ifile_name.replace(".ins",""),pst_path='.')
     pst.observation_data.loc[pdf.obsnme.values,"weight"] = 0.0
     pst.observation_data.loc[pdf.obsnme.values, "obsval"] = 0.0
