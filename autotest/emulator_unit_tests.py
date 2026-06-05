@@ -838,6 +838,61 @@ class TestBaseUpdateObservationData:
         assert result.loc["o0", "obgnme"] == "grp"
 
 
+class TestConfigurePstFileRefOptions:
+    """File-referencing pestpp options must not be carried into emulator
+    templates: the referenced files are not copied into the template dir, so
+    a runstore run (``pestpp-ies dsi.pst /e``) would crash trying to read
+    them."""
+
+    def test_file_ref_options_dropped(self, tmp_path):
+        from pyemu.emulators import DSI
+
+        data, obsdata = _synth_data()
+        dsi = DSI(data=data, pst=obsdata, verbose=False)
+        dsi.fit()
+
+        # build a source pst by preparing a first template, then decorate it
+        # with options pointing at files that will not exist in the next
+        # template dir (mixed case on purpose: keys may be user-set)
+        src_td = str(tmp_path / "src_td")
+        src = dsi.prepare_pestpp(src_td, observation_data=obsdata,
+                                 use_runstor=True)
+        src.pestpp_options["ies_parameter_ensemble"] = "prior_pe.jcb"
+        src.pestpp_options["OPT_PAR_STACK"] = "stack.csv"
+        src.pestpp_options["hotstart_resfile"] = "old.res"
+        src.pestpp_options["ies_num_reals"] = 30
+
+        td = str(tmp_path / "td")
+        pst = dsi.prepare_pestpp(td, pst=src, use_runstor=True)
+
+        kept = {k.lower() for k in pst.pestpp_options}
+        assert "ies_parameter_ensemble" not in kept
+        assert "opt_par_stack" not in kept
+        assert "hotstart_resfile" not in kept
+        assert pst.pestpp_options["ies_num_reals"] == 30
+        # DSI re-sets parcov to its own unc file after the scaffolding
+        assert pst.pestpp_options["parcov"] == "dsi.unc"
+
+    @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
+    def test_dsiae_own_ensemble_survives_filter(self, tmp_path):
+        """DSIAE sets ies_parameter_ensemble after the base scaffolding, so
+        the filter drops only the inherited value, not DSIAE's own."""
+        from pyemu.emulators import DSI, DSIAE
+
+        data, obsdata = _synth_data(n_obs=6)
+        dsiae = DSIAE(data=data, pst=obsdata, latent_dim=2, verbose=False)
+        dsiae.fit(epochs=2, batch_size=32)
+
+        src_td = str(tmp_path / "src_td")
+        src = dsiae.prepare_pestpp(src_td, observation_data=obsdata,
+                                   use_runstor=True)
+        src.pestpp_options["ies_parameter_ensemble"] = "prior_pe.jcb"
+
+        td = str(tmp_path / "td")
+        pst = dsiae.prepare_pestpp(td, pst=src, use_runstor=True)
+        assert pst.pestpp_options["ies_parameter_ensemble"] == "latent_prior.jcb"
+
+
 class TestBaseValidateTransforms:
     """Tests for Emulator._validate_transforms error handling."""
 

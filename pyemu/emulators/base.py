@@ -10,6 +10,28 @@ from ..logger import Logger
 from pyemu.pst.pst_handler import Pst
 from pyemu.utils.os_utils import run
 
+# pestpp options whose values reference external files. These must not be
+# carried from a source control file into an emulator template dir: the
+# referenced files are not copied there, so PEST++ would crash trying to
+# read them (canonical names and aliases; compared case-insensitively).
+_FILE_REF_PESTPP_OPTIONS = frozenset([
+    "parcov",
+    "ies_parameter_ensemble", "ies_par_en",
+    "ies_observation_ensemble", "ies_obs_en",
+    "ies_weight_ensemble", "ies_weight_en",
+    "ies_restart_observation_ensemble", "ies_restart_obs_en",
+    "ies_restart_parameter_ensemble", "ies_restart_par_en",
+    "da_parameter_ensemble", "da_par_en",
+    "da_observation_ensemble", "da_obs_en",
+    "da_weight_ensemble", "da_weight_en",
+    "da_restart_observation_ensemble", "da_restart_obs_en",
+    "da_restart_parameter_ensemble", "da_restart_par_en",
+    "opt_par_stack", "opt_obs_stack",
+    "mou_dv_population_file", "mou_obs_population_restart_file",
+    "hotstart_resfile",
+])
+
+
 class Emulator:
     """
     Base class for emulators.
@@ -399,8 +421,19 @@ class Emulator:
         """
         if pst_old is not None:
             if pst_old.pestpp_options is not None:
-                # carry across pestpp options
-                pst_new.pestpp_options = pst_old.pestpp_options.copy()
+                # carry across pestpp options, dropping any that reference
+                # external files (not copied into the template dir)
+                kept, dropped = {}, []
+                for key, value in pst_old.pestpp_options.items():
+                    if key.lower() in _FILE_REF_PESTPP_OPTIONS:
+                        dropped.append(key)
+                    else:
+                        kept[key] = value
+                pst_new.pestpp_options = kept
+                if dropped:
+                    self.logger.statement(
+                        "dropped file-referencing pestpp options from source "
+                        "pst: {0}".format(", ".join(dropped)))
 
             if pst_old.prior_information is not None:
                 # and prior info
