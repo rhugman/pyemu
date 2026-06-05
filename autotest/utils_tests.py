@@ -3621,6 +3621,79 @@ def pestpp_runstorage_file_test(tmp_path):
     assert diff.max() < 1.0e-7
 
 
+def prep_for_gpr_prepare_test(tmp_path):
+    """prepare-level coverage for prep_for_gpr: tiny populations, no MOU loop.
+
+    The full *_invest workflows are too heavy for CI; this pins the glue
+    (population loading, per-output GPR fits, pst assembly, par-data transfer,
+    canonical tpl/ins, generated forward_run) in a few seconds."""
+    import py_compile
+    import numpy as np
+
+    np.random.seed(3)
+    par_names = ["dv0", "dv1"]
+    obs_names = ["obj1", "other"]
+    pst = pyemu.pst_utils.generic_pst(par_names, obs_names)
+    par = pst.parameter_data
+    par.loc[:, "partrans"] = "none"
+    par.loc[:, "parlbnd"] = 0.0
+    par.loc[:, "parubnd"] = 10.0
+    par.loc[:, "parval1"] = 5.0
+    pst.pestpp_options["mou_objectives"] = "obj1"
+    pst.control_data.noptmax = 25
+    pst_fname = os.path.join(tmp_path, "gprprep.pst")
+    pst.write(pst_fname, version=2)
+
+    # training populations: learnable input-output relation
+    dv = pd.DataFrame(np.random.uniform(0, 10, size=(20, 2)), columns=par_names)
+    obs = pd.DataFrame({"obj1": dv.sum(axis=1) + np.random.normal(0, 0.01, 20),
+                        "other": np.random.normal(size=20)})
+    dv_fname = os.path.join(tmp_path, "dv_pop.csv")
+    obs_fname = os.path.join(tmp_path, "obs_pop.csv")
+    dv.to_csv(dv_fname)
+    obs.to_csv(obs_fname)
+
+    t_d = os.path.join(tmp_path, "template")  # listed for pestpp binaries
+    os.makedirs(t_d)
+    gpr_t_d = os.path.join(tmp_path, "gpr_template")
+    for std in (False, True):
+        pyemu.helpers.prep_for_gpr(pst_fname, [dv_fname], [obs_fname],
+                                   gpr_t_d=gpr_t_d, t_d=t_d, nverf=2,
+                                   include_emulated_std_obs=std)
+
+        gpst = pyemu.Pst(os.path.join(gpr_t_d, "gprprep.pst"))
+        assert set(gpst.par_names) == set(par_names)
+        expected_obs = {"obj1", "obj1_gprstd"} if std else {"obj1"}
+        assert set(gpst.obs_names) == expected_obs
+        # par data transferred, noptmax restored after the internal test run
+        assert np.isclose(float(gpst.parameter_data.loc["dv0", "parubnd"]), 10.0)
+        assert gpst.control_data.noptmax == 25
+
+        # fitted model registry + loadable pickle
+        mdf = pd.read_csv(os.path.join(gpr_t_d, "gprmodel_info.csv"), index_col=0)
+        assert "obj1" in mdf.output_name.values
+        import pickle
+        mfname = mdf.loc[mdf.output_name == "obj1", "model_fname"].iloc[0]
+        with open(os.path.join(gpr_t_d, os.path.basename(mfname)), "rb") as f:
+            pickle.load(f)
+
+        # canonical tpl/ins (the consolidated pst_utils writers)
+        tpl = open(os.path.join(gpr_t_d, "gpr_input.csv.tpl")).read().splitlines()
+        assert tpl[0] == "ptf ~"
+        assert tpl[1] == "parnme,parval1"
+        for line in tpl[2:]:
+            name = line.split(",")[0]
+            assert line == f"{name},~   {name}   ~"
+        ins = open(os.path.join(gpr_t_d, "gpr_output.csv.ins")).read()
+        if std:
+            assert "l1 ~,~ !obj1! ~,~ !obj1_gprstd!\n" in ins
+        else:
+            assert "l1 ~,~ !obj1!\n" in ins
+
+        # generated forward run compiles
+        py_compile.compile(os.path.join(gpr_t_d, "forward_run.py"), doraise=True)
+
+
 if __name__ == "__main__":
     pestpp_runstorage_file_test(".")
     #geostat_draws_test('.')
