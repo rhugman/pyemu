@@ -113,8 +113,8 @@ def test_log10_transform_uses_fitted_shift_on_new_frame():
 def test_log10_roundtrip_survives_intervening_transform():
     """Regression (state corruption): inverse_transform(transform(train)) must
     round-trip, AND must still round-trip after an intervening transform() on a
-    different positive-min frame. Pre-fix the intervening call overwrote the
-    fitted shift and broke the round-trip."""
+    different positive-min frame (an intervening call that re-learned the
+    shift would break the round-trip)."""
     train = pd.DataFrame({'a': [-5.0, 0.0, 10.0]})
     t = pyemu.emulators.Log10Transformer(columns=['a'])
     t.fit(train)
@@ -126,9 +126,9 @@ def test_log10_roundtrip_survives_intervening_transform():
     inversed = t.inverse_transform(transformed)
     np.testing.assert_allclose(inversed['a'].values, train['a'].values, atol=1e-5)
 
-    # Intervening transform on a different, positive-min frame. Pre-fix this
-    # re-learns a 0 shift and overwrites the stored training shift, so the
-    # SAME already-transformed train data no longer inverts correctly.
+    # Intervening transform on a different, positive-min frame. If this
+    # re-learned a 0 shift it would overwrite the stored training shift, and
+    # the SAME already-transformed train data would no longer invert correctly.
     other = pd.DataFrame({'a': [10.0, 20.0, 30.0]})
     _ = t.transform(other)
 
@@ -733,7 +733,7 @@ def _curved_frame(col='c', n=60, seed=42):
 
 
 def _old_linear_below_z(originals, z_scores, v):
-    """OLD (pre-fix) forward extrapolation below the data minimum: linear in the
+    """Superseded forward extrapolation below the data minimum: linear in the
     end knot PAIR, slope = (z1 - z0) / (o1 - o0)."""
     o = np.asarray(originals, dtype=float)
     z = np.asarray(z_scores, dtype=float)
@@ -743,7 +743,7 @@ def _old_linear_below_z(originals, z_scores, v):
 
 
 def _old_linear_above_z(originals, z_scores, v):
-    """OLD (pre-fix) forward extrapolation above the data maximum: linear in the
+    """Superseded forward extrapolation above the data maximum: linear in the
     end knot PAIR, slope = (z[-1] - z[-2]) / (o[-1] - o[-2])."""
     o = np.asarray(originals, dtype=float)
     z = np.asarray(z_scores, dtype=float)
@@ -753,7 +753,7 @@ def _old_linear_above_z(originals, z_scores, v):
 
 
 def test_normal_score_quadratic_tail_round_trip_both_tails():
-    """(a) Round-trip exactness in BOTH tails on curved data:
+    """Round-trip exactness in BOTH tails on curved data:
     inverse_transform(transform(x)) == x for probes below the data minimum and
     above the data maximum (transform uses the cancellation-free quadratic root
     so it is an exact inverse of the tail curve)."""
@@ -777,7 +777,7 @@ def test_normal_score_quadratic_tail_round_trip_both_tails():
 
 
 def test_normal_score_quadratic_tail_is_actually_quadratic():
-    """(b) The upper tail honours curvature: inverse over a uniform z-grid beyond
+    """The upper tail honours curvature: inverse over a uniform z-grid beyond
     the max z has a nonzero second difference (a straight line would give zero),
     AND the forward transform of an out-of-range value differs from the OLD
     end-pair linear extrapolation formula."""
@@ -808,7 +808,7 @@ def test_normal_score_quadratic_tail_is_actually_quadratic():
 
 
 def test_normal_score_quadratic_tail_monotone_and_finite():
-    """(c) transform of a fine grid spanning [min-2, max+2] is strictly
+    """transform of a fine grid spanning [min-2, max+2] is strictly
     increasing and finite, for BOTH the curved data and a tied-end dataset."""
     curved = _curved_frame('c')
     tied = pd.DataFrame({'t': np.concatenate([np.linspace(1, 99, 32), np.full(8, 100.0)])})
@@ -826,9 +826,9 @@ def test_normal_score_quadratic_tail_monotone_and_finite():
 
 
 def test_normal_score_tied_end_residual_regression():
-    """(d) Tied-end sanity (f9-residual regression): on the tied-end dataset,
-    transform(100.5) is a small z-score between 2 and 10 (pre-fix the degenerate
-    end-pair slope blew this up to ~1e13)."""
+    """Tied-end sanity: on the tied-end dataset, transform(100.5) is a small
+    z-score between 2 and 10 (previously the degenerate end-pair slope blew
+    this up to ~1e13)."""
     col = 't'
     df = pd.DataFrame({col: np.concatenate([np.linspace(1, 99, 32), np.full(8, 100.0)])})
 
@@ -840,7 +840,7 @@ def test_normal_score_tied_end_residual_regression():
 
 
 def test_normal_score_quadratic_n1_clamps_no_crash():
-    """(e) n=1 with quadratic_extrapolation=True: no crash (pre-fix this raised
+    """n=1 with quadratic_extrapolation=True: no crash (previously this raised
     IndexError); out-of-range values clamp to the boundary."""
     col = 'c'
     df = pd.DataFrame({col: [5.0]})
@@ -867,7 +867,7 @@ def test_normal_score_quadratic_n1_clamps_no_crash():
 
 
 def test_normal_score_quadratic_constant_column_clamps():
-    """(f) Constant column with quadratic_extrapolation=True: out-of-range values
+    """Constant column with quadratic_extrapolation=True: out-of-range values
     clamp to the boundary z-scores / originals (no explosion)."""
     col = 'c'
     df = pd.DataFrame({col: np.full(40, 7.0)})
@@ -892,7 +892,7 @@ def test_normal_score_quadratic_constant_column_clamps():
 
 
 def test_normal_score_clamp_false_unchanged():
-    """(g) clamp behaviour (quadratic_extrapolation=False) is unchanged:
+    """clamp behaviour (quadratic_extrapolation=False) is unchanged:
     out-of-range maps exactly to the boundary z / boundary original."""
     col = 'c'
     df = _curved_frame(col)
@@ -924,7 +924,7 @@ def test_normal_score_clamp_false_unchanged():
 # ---------------------------------------------------------------------------
 
 def test_normal_score_linear_tail_straight_roundtrip_and_finite():
-    """(a) linear mode: each tail is a straight line (zero second difference of
+    """linear mode: each tail is a straight line (zero second difference of
     the inverse on a z-grid beyond the max), round-trips exactly in BOTH tails,
     and the forward transform across the boundary is monotone and finite."""
     col = 'c'
@@ -962,7 +962,7 @@ def test_normal_score_linear_tail_straight_roundtrip_and_finite():
 
 
 def test_normal_score_linear_tail_tie_robust():
-    """(a) linear mode is tie-robust: on the tied-end dataset
+    """linear mode is tie-robust: on the tied-end dataset
     linspace(1, 99, 32) + 8x100.0 the adaptive knot selection skips the tied
     knots, so transform(100.5) is a small z in (2, 10) (a degenerate end-pair
     slope would blow this up)."""
@@ -977,7 +977,7 @@ def test_normal_score_linear_tail_tie_robust():
 
 
 def test_normal_score_extrapolation_alias_mapping():
-    """(b) the deprecated boolean maps onto the resolved .extrapolation, and an
+    """the deprecated boolean maps onto the resolved .extrapolation, and an
     explicit extrapolation overrides it:
       - quadratic_extrapolation=True  -> .extrapolation == "quadratic", curved tails
       - default                       -> .extrapolation == "clamp", out-of-range clamps
@@ -1016,13 +1016,13 @@ def test_normal_score_extrapolation_alias_mapping():
 
 
 def test_normal_score_invalid_extrapolation_raises():
-    """(c) an invalid extrapolation value raises ValueError at construction."""
+    """an invalid extrapolation value raises ValueError at construction."""
     with pytest.raises(ValueError):
         pyemu.emulators.NormalScoreTransformer(extrapolation="cubic")
 
 
 def test_normal_score_autobots_apply_passes_extrapolation():
-    """(d) config wiring: AutobotsAssemble(df).apply("normal_score",
+    """config wiring: AutobotsAssemble(df).apply("normal_score",
     extrapolation="linear") stores a NormalScoreTransformer whose
     .extrapolation == "linear"."""
     col = 'c'
@@ -1037,7 +1037,7 @@ def test_normal_score_autobots_apply_passes_extrapolation():
 
 
 def test_normal_score_pre_feature_pickle_compat():
-    """(e) pre-feature pickle compat: an instance lacking the .extrapolation
+    """pre-feature pickle compat: an instance lacking the .extrapolation
     attribute (as unpickled from before the feature existed) falls back to the
     deprecated boolean. After deleting .extrapolation, transforming an
     out-of-range value still works (finite) and _extrapolation_mode() resolves

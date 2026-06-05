@@ -876,13 +876,13 @@ class TestBaseValidateTransforms:
 
 
 # ===========================================================================
-# GROUNDWORK FIX REGRESSION TESTS (DSIVC refactor preconditions)
+# Emulator name handling, template-dir contract, and runstore robustness
 # ===========================================================================
 
 
 class TestBaseLowercaseIntake:
-    """Fix base-lowercase: Emulator._lowercase_intake (base.py) lowercases all
-    name-keyed state (data columns, transform 'columns' lists) at intake."""
+    """Emulator._lowercase_intake (base.py) lowercases all name-keyed state
+    (data columns, transform 'columns' lists) at intake."""
 
     def test_base_lowercase_data_and_transform_columns(self):
         """Mixed-case data columns and transform 'columns' are lowercased."""
@@ -1063,7 +1063,7 @@ class TestDSILowercaseIntake:
 
 
 class TestDSIPrepareWritesPst:
-    """Fix dsi-pst-write: DSI.prepare_pestpp writes a complete dsi.pst to t_d."""
+    """DSI.prepare_pestpp writes a complete dsi.pst to t_d."""
 
     @staticmethod
     def _data():
@@ -1135,8 +1135,8 @@ class TestDSIPrepareWritesPst:
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
 class TestDSIAEConfigurePstObservationData:
-    """Fix dsiae-f1: DSIAE._configure_pst_object accepts and applies the
-    observation_data kwarg the base hook caller always passes."""
+    """DSIAE._configure_pst_object accepts and applies the observation_data
+    kwarg the base hook caller always passes."""
 
     @staticmethod
     def _fit_dsiae(latent_dim=3):
@@ -1200,8 +1200,8 @@ class TestDSIAEConfigurePstObservationData:
 
 
 class TestLatentIndexOrdering:
-    """Fix helpers-f13: dsi_runstore_forward_run orders run-store columns by the
-    trailing integer of the parameter name (robust to dsi_par0000 names)."""
+    """dsi_runstore_forward_run orders run-store columns by the trailing
+    integer of the parameter name (robust to dsi_par0000 names)."""
 
     @staticmethod
     def _trailing_int_key(name):
@@ -1268,8 +1268,8 @@ class TestLatentIndexOrdering:
 
 @pytest.mark.skipif(not HAS_TENSORFLOW, reason="TensorFlow not available")
 class TestDSIRunstoreForwardRunOrdering:
-    """Fix helpers-f13 (integration): dsi_runstore_forward_run runs on
-    DSIAE-style dsi_parNNNN names without ValueError and orders pvals correctly."""
+    """dsi_runstore_forward_run runs on DSIAE-style dsi_parNNNN names without
+    ValueError and orders pvals correctly (integration)."""
 
     def test_dsi_runstore_forward_run_dsiae_names(self, tmp_path, monkeypatch):
         import pyemu.emulators as emu_mod
@@ -1710,7 +1710,8 @@ class TestDSIVCGeneratedScript:
 
 
 class TestDSIVCInjection:
-    """_dsivc_inject_decvars (f3 regression: Series assignment, pandas>=2 safe)."""
+    """_dsivc_inject_decvars: Series-aligned assignment (pandas>=2 safe) and
+    zero-noise decvar columns."""
 
     def test_inject_updates_obsval_and_noise(self, tmp_path):
         """obsval updated; noise.jcb has decvar columns EXACTLY constant at the
@@ -1835,7 +1836,8 @@ class TestDSIVCIterationDiscovery:
 
 
 class TestDSIVCPositionalStack:
-    """Per-realization stack obs are POSITIONAL (f10 regression)."""
+    """Per-realization stack obs are named POSITIONALLY, never from
+    realization labels."""
 
     def test_stack_long_positional_names(self, tmp_path):
         """_dsivc_stack_long on weird string row labels -> col_real:0..n-1 names,
@@ -1959,7 +1961,7 @@ class TestDSIVCOverDSIAE:
     emulator.data, so a fitted DSIAE composes the same as a DSI.
 
     Prepare-level only (no binary run): a full DSIAE runstore template via
-    DSIAE.prepare_pestpp is still blocked by parked DSIAE defects, so the
+    DSIAE.prepare_pestpp is still blocked by known DSIAE defects, so the
     template here is DSI-produced over the same training data."""
 
     def test_dsiae_prepare_pestpp(self, tmp_path):
@@ -1970,7 +1972,7 @@ class TestDSIVCOverDSIAE:
         dsi, dsi_t_d, pst, cols = _make_runstore_dsi(tmp_path)
         oe = _make_oe(pst, cols)
 
-        # no pst: DSIAE.__init__ can't take a DataFrame pst (parked defect) and
+        # no pst: DSIAE.__init__ can't take a DataFrame pst (known defect) and
         # DSIVC consumes only emulator.fitted + emulator.data anyway
         data, _, _ = _dsivc_synth()
         dsiae = DSIAE(data=data, latent_dim=2, verbose=False)

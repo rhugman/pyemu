@@ -10,9 +10,6 @@ in runstore mode (``pestpp-ies dsi.pst /e``).  The conditioned posterior ensembl
 (the "stack") is summarized into per-output percentile observations (the "stack
 stats"), which are the outer problem's observations.  The user defines objectives
 and constraints on those stack-stats manually.
-
-See ``docs/adr/0002-dsivc-composition-runstore-only.md`` and the "DSI variable
-control (DSIVC)" glossary section in ``CONTEXT.md``.
 """
 from __future__ import print_function, division
 import os

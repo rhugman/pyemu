@@ -1357,7 +1357,7 @@ class TestDSIFitPredict:
         call must NOT overwrite the Log10Transformer's fitted training shifts.
         After construction the Log10Transformer must still hold the TRAINING
         shifts (-train_min + 1e-6), not 0 (which is what the positive-obsval
-        truth prefit would have re-learned pre-fix)."""
+        truth prefit would re-learn if shifts were fit at transform time)."""
         from pyemu.emulators.transformers import Log10Transformer
 
         data, _ = _synth_data()
@@ -1370,7 +1370,8 @@ class TestDSIFitPredict:
             assert train_mins[col] < 0
 
         # obsdata (pst): index = obs names, 'obsval' column, all POSITIVE obsvals.
-        # Positive truth values are exactly what would re-learn a 0 shift pre-fix.
+        # Positive truth values are exactly what a transform-time re-fit would
+        # turn into a 0 shift.
         obsdata = pd.DataFrame(
             {
                 "obsnme": data.columns,
@@ -1597,7 +1598,7 @@ class TestGPRFitPredict:
             pred_before["y"].values, pred_after["y"].values, atol=1e-10
         )
 
-    # -- regression tests for transform-copy (f6) and predict alignment (f8) --
+    # -- regression tests for transform-copy and predict column alignment --
 
     @staticmethod
     def _two_input_gpr_data(seed=0):
