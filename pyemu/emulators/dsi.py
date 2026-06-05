@@ -15,10 +15,31 @@ class DSI(Emulator):
     """
     Data Space Inversion (DSI) emulator class. Based on DSI as described in Sun &
     Durlofsky (2017) and Sun et al (2017).
-        
+
     """
 
-    def __init__(self, 
+    # latent parameter bound magnitude written to the control file; subclasses may narrow it
+    _latent_par_bound = 1.0e10
+
+    @property
+    def latent_dim(self):
+        """Number of latent data-space coordinates.
+
+        Returns
+        -------
+        int
+            The number of columns in the projection matrix.
+
+        Raises
+        ------
+        Exception
+            If the emulator has not been fitted (no projection matrix yet).
+        """
+        if getattr(self, "pmat", None) is None:
+            raise Exception("latent_dim is undefined before fit (no projection matrix yet)")
+        return self.pmat.shape[1]
+
+    def __init__(self,
                 pst=None,
                 data=None,
                 transforms=None,
@@ -184,15 +205,15 @@ class DSI(Emulator):
 
         # In DSI, parameters are the projections in latent space (p_0, p_1, ...)
         # Number of parameters = dimensionality of projection matrix (columns)
-        num_pars = self.pmat.shape[1]
-        
+        num_pars = self.latent_dim
+
         par_names = [f"p_{i}" for i in range(num_pars)]
-        
+
         df = pd.DataFrame(index=par_names)
         df["parnme"] = par_names
         df["parval1"] = 0.0 # DSI assumes centered parameters (mean 0)
-        df["parlbnd"] = -1.0e10 # Effectively unbounded, but good to have ranges
-        df["parubnd"] = 1.0e10
+        df["parlbnd"] = -self._latent_par_bound # Effectively unbounded, but good to have ranges
+        df["parubnd"] = self._latent_par_bound
         df["pargp"] = "dsi_pars"
         df["partrans"] = "none"
         
@@ -362,6 +383,28 @@ class DSI(Emulator):
         self.fitted = True
         return self
     
+    def _reconstruct(self, pvals):
+        """Reconstruct transformed-space observations from latent coordinates.
+
+        Parameters
+        ----------
+        pvals : numpy.ndarray
+            A 2-D float array of shape (n_realizations, latent_dim).
+
+        Returns
+        -------
+        numpy.ndarray
+            A 2-D float array of shape (n_realizations, n_obs) holding the
+            reconstructed values in transformed space, that is before row-wise
+            inverse scaling and before inverse feature transforms.
+
+        Notes
+        -----
+        Subclasses override this to swap the linear map for another decoder.
+        """
+        ovals = self.ovals.values if hasattr(self.ovals, 'values') else self.ovals
+        return (ovals[:, np.newaxis] + np.dot(self.pmat, pvals.T)).T
+
     def predict(self, pvals, pst: Pst = None):
         """
         Generate predictions from the emulator.
@@ -403,37 +446,30 @@ class DSI(Emulator):
                 single_realization = False
         
         # Validate dimensions
-        if pvals.shape[1] != self.pmat.shape[1]:
-            raise ValueError(f"pvals must have {self.pmat.shape[1]} parameters, got {pvals.shape[1]}")
-        
-        # Compute predictions for all realizations
-        pmat = self.pmat
-        ovals = self.ovals.values if hasattr(self.ovals, 'values') else self.ovals
-        
-        # Matrix multiplication: (n_obs x n_params) @ (n_params x n_realizations)
-        # Result is (n_obs, n_realizations)
-        sim_vals_arr = ovals[:, np.newaxis] + np.dot(pmat, pvals.T)
-        
-        # Determine column names (observations)
-        if hasattr(self.ovals, 'index'):
-             obs_names = self.ovals.index
-        else:
-             obs_names = self.data_transformed.columns
+        if pvals.shape[1] != self.latent_dim:
+            raise ValueError(f"pvals must have {self.latent_dim} parameters, got {pvals.shape[1]}")
 
-        # Convert to pandas structure (transposed to: n_realizations x n_obs)
+        # Reconstruct transformed-space observations (n_realizations x n_obs)
+        sim_vals_arr = self._reconstruct(pvals)
+
+        # Determine column names (observations). For DSI, ovals.index is exactly
+        # data_transformed.columns; DSIAE has no ovals, so resolve from the data.
+        obs_names = self.data_transformed.columns
+
+        # Convert to pandas structure (n_realizations x n_obs)
         if single_realization:
             # Return Series for single realization
-            sim_vals = pd.Series(sim_vals_arr.flatten(), index=obs_names)
+            sim_vals = pd.Series(sim_vals_arr[0], index=obs_names)
             sim_vals.index.name = 'obsnme'
             sim_vals.name = "obsval"
-            
+
             # Temporary DataFrame for unified processing
             sim_df = sim_vals.to_frame().T
             sim_df.index = [getattr(self, '_truth_row_index', 'truth')] # mimic truth index for 1-row case
         else:
             # Return DataFrame for multiple realizations
-            sim_df = pd.DataFrame(sim_vals_arr.T, 
-                                columns=obs_names, 
+            sim_df = pd.DataFrame(sim_vals_arr,
+                                columns=obs_names,
                                 index=realization_names,
                                 )
             sim_df.index.name = 'realization'
