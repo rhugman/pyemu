@@ -4889,18 +4889,15 @@ def gpr_runstore_forward_run(ws='.', emu_file="gpr_emulator.pkl", pst_name="gpr"
 def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
     import os
     import re
+    import pickle
     from pyemu.utils.helpers import RunStor
+    emu_file = os.path.join(ws, "dsi.pickle")
     try:
-        from pyemu.emulators import DSIAE
-        dsi = DSIAE.load(os.path.join(ws,"dsi.pickle"))
-        latent_dim = dsi.latent_dim
-    except:
-        try:
-            from pyemu.emulators import DSI
-            dsi = DSI.load(os.path.join(ws,"dsi.pickle"))
-            latent_dim = dsi.s.shape[0]
-        except Exception as e:
-            raise Exception("failed to load DSI or DSIAE from dsi.pickle:{0}".format(str(e)))
+        with open(emu_file, "rb") as f:
+            dsi = pickle.load(f)
+    except Exception as e:
+        raise Exception("failed to load emulator from {0}: {1}".format(emu_file, str(e)))
+    latent_dim = dsi.latent_dim
 
     fname = os.path.join(ws, f"{pst_name}.rns")
     if not os.path.exists(fname):
@@ -4912,8 +4909,8 @@ def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
     # sort par_names to match latent dimension order.
     # predict() consumes pvals positionally (pmat @ pvals.T / decoder), so column i
     # must be latent dimension i.  The latent index is the trailing integer of the
-    # parameter name; the regex handles both "p_3"/"sv_3" (DSI) and "dsi_par0000"
-    # (DSIAE), the latter of which int(x.split("_")[-1]) cannot parse.
+    # parameter name; the regex handles both "p_3"/"sv_3" and "dsi_par0000", the
+    # latter of which int(x.split("_")[-1]) cannot parse.
     def _latent_index(pname):
         m = re.search(r"(\d+)$", pname)
         if m is None:
@@ -4938,33 +4935,18 @@ def dsi_runstore_forward_run(ws='.', pst_name="dsi"):
 
 def dsi_file_forward_run(emu_file="dsi.pickle", input_file="dsi_pars.csv", output_file="dsi_sim_vals.csv"):
     import os
+    import pickle
     import pandas as pd
     import traceback
-    
-    try:
-        # Try loading as DSIAE first, then DSI
-        try:
-            from pyemu.emulators import DSIAE, DSI
-        except ImportError:
-            # Should be available in standard installation
-            raise ImportError("pyemu.emulators.DSI and/or DSIAE could not be imported")
 
-        emu = None
-        # Try DSIAE.load (checks for folder/zip etc)
+    try:
         try:
-             emu = DSIAE.load(emu_file)
-        except:
-             pass
-        
-        # If not loaded, try DSI.load (standard pickle)
-        if emu is None:
-             try:
-                 emu = DSI.load(emu_file)
-             except Exception as e:
-                 raise Exception(f"Failed to load emulator from {emu_file}. Tried DSIAE.load and DSI.load. Error: {e}")
+            with open(emu_file, "rb") as f:
+                emu = pickle.load(f)
+        except Exception as e:
+            raise Exception(f"Failed to load emulator from {emu_file}: {e}")
 
         if not os.path.exists(input_file):
-        # ...
              raise FileNotFoundError(f"Input file {input_file} not found")
              
         input_df = pd.read_csv(input_file, index_col=0)
