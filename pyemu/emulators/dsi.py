@@ -144,10 +144,10 @@ class DSI(Emulator):
         # If row-wise scaling is enabled and truth is available, pre-fit truth scaler once
         self._truth_rowwise_scaler = None
         if self.rowwise_groups is not None and self.observation_data is not None:
-            try:
-                self._truth_rowwise_scaler = self._prefit_truth_rowwise_scaler()
-            except Exception as ex:
-                self.logger.warn(f"Failed to pre-fit truth row-wise scaler (will try at predict time): {ex}")
+            # truth values are present: a failure here (e.g. a truth value
+            # outside the fitted transform domain) is a data error the user
+            # must fix now, not a condition to defer to predict time
+            self._truth_rowwise_scaler = self._prefit_truth_rowwise_scaler()
         else:
             self._truth_row_index = 'truth'
 
@@ -476,25 +476,20 @@ class DSI(Emulator):
 
         # --- Row-wise Inverse Scaling (Logic from dsi copy.py adapted for broadcasting) ---
         if self.rowwise_groups is not None:
-             # Row-wise scaling used: use pre-fitted truth scaler if available, else build once from provided pst
+            # use the pre-fitted truth scaler, else fit once from truth
+            # values provided at predict time
             truth_scaler = self._truth_rowwise_scaler
             if truth_scaler is None:
-                # If not pre-fitted, try to fit now
                 if pst is not None:
-                     # Update internal observation data for context
-                     self.observation_data = pst.observation_data.copy()
-                
-                # Check if we have what we need
+                    self.observation_data = pst.observation_data.copy()
                 if self.observation_data is None:
-                     # Fallback or error? dsi copy.py requires it.
-                     self.logger.warn("Row-wise scaling enabled but no truth data found. Predictions remain in scaled space relative to training mean/std.")
-                else:
-                    try:
-                        truth_scaler = self._prefit_truth_rowwise_scaler()
-                        self._truth_rowwise_scaler = truth_scaler
-                    except Exception as e:
-                        self.logger.warn(f"Failed to fit truth scaler: {e}")
-            
+                    raise ValueError(
+                        "row-wise scaling requires truth values to "
+                        "inverse-scale predictions; provide them via the "
+                        "pst argument")
+                truth_scaler = self._prefit_truth_rowwise_scaler()
+                self._truth_rowwise_scaler = truth_scaler
+
             if truth_scaler is not None:
                  # Apply inverse row-wise scaling efficiently
                  # Truth scaler has params for ONE row (the truth). We apply this to ALL rows.

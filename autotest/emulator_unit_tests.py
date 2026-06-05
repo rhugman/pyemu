@@ -142,6 +142,57 @@ class TestDSIFitPredict:
         # Values should be finite (no NaN / Inf from inverse scaling)
         assert np.all(np.isfinite(result.values))
 
+    @staticmethod
+    def _rowwise_log10_setup(truth_override=None):
+        """Positive data + log10 transform + one rowwise group; optionally
+        override one truth obsval (e.g. to push it below the log domain)."""
+        data, obsdata = _synth_data()
+        data = data.abs() + 1.0
+        obsdata = obsdata.copy()
+        obsdata["obsval"] = data.mean().values
+        if truth_override is not None:
+            obsdata.loc["obs0", "obsval"] = truth_override
+        rowwise_groups = {"g1": [f"obs{i}" for i in range(10)]}
+        transforms = [{"type": "log10"}]
+        return data, obsdata, rowwise_groups, transforms
+
+    def test_rowwise_invalid_truth_raises_at_construction(self):
+        """A truth value the fitted transform cannot represent is a data
+        error and must fail at construction, not be deferred."""
+        from pyemu.emulators import DSI
+
+        data, obsdata, groups, transforms = self._rowwise_log10_setup(
+            truth_override=-1.0)
+        with pytest.raises(ValueError):
+            DSI(data=data, pst=obsdata, transforms=transforms,
+                rowwise_groups=groups, verbose=False)
+
+    def test_rowwise_predict_without_truth_raises(self):
+        """No truth values anywhere: predict must raise, never return
+        scaled-space output."""
+        from pyemu.emulators import DSI
+
+        data, _, groups, transforms = self._rowwise_log10_setup()
+        dsi = DSI(data=data, transforms=transforms, rowwise_groups=groups,
+                  verbose=False)
+        dsi.fit()
+        with pytest.raises(ValueError, match="truth"):
+            dsi.predict(np.zeros(dsi.latent_dim))
+
+    def test_rowwise_truth_supplied_at_predict_works(self):
+        """The deferred workflow: construct without truth, supply it via the
+        pst argument at predict time."""
+        from types import SimpleNamespace
+        from pyemu.emulators import DSI
+
+        data, obsdata, groups, transforms = self._rowwise_log10_setup()
+        dsi = DSI(data=data, transforms=transforms, rowwise_groups=groups,
+                  verbose=False)
+        dsi.fit()
+        result = dsi.predict(np.zeros(dsi.latent_dim),
+                             pst=SimpleNamespace(observation_data=obsdata))
+        assert np.all(np.isfinite(result.values))
+
     def test_save_load(self, tmp_path):
         """Round-trip pickle preserves predictions."""
         from pyemu.emulators import DSI
